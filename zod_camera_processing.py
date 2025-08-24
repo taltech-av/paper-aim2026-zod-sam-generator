@@ -13,7 +13,7 @@ from zod.utils.polygon_transformations import polygons_to_binary_mask
 from zod.visualization.polygon_utils import overlay_mask_on_image
 from zod.visualization.oxts_on_image import visualize_oxts_on_image
 
-def initialize_zod_frames(dataset_root: str = "../data_zod", version: str = "mini") -> ZodFrames:
+def initialize_zod_frames(dataset_root: str = "./data", version: str = "mini") -> ZodFrames:
     """
     Initialize ZodFrames object with specified dataset root and version.
     
@@ -124,7 +124,7 @@ def process_frame_with_annotations(zod_frames: ZodFrames, frame_id: str) -> Imag
 
 
 def main():
-    dataset_root = "../data_zod"  # your local path to zod
+    dataset_root = "./data"  # your local path to zod
     version = "mini"  # "mini" or "full"
     output_dir = '/workspace/output/camera'
     

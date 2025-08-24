@@ -39,13 +39,7 @@ services:
     ports:
       - "8889:8888"  # Different port to avoid conflicts
     working_dir: /workspace
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    gpus: all
     shm_size: '16g'
 
 volumes:

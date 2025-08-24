@@ -11,6 +11,9 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from pathlib import Path
 from typing import List
+import urllib.request
+import shutil
+import sys
 
 # ZOD imports
 from zod import ZodFrames
@@ -26,6 +29,42 @@ try:
 except ImportError:
     SAM_AVAILABLE = False
     print("SAM not available. Install with: pip install segment-anything")
+
+# URL for the SAM checkpoint
+SAM_DOWNLOAD_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
+
+def _download_file(url: str, dest: str) -> bool:
+    """Download url to dest (streaming). Returns True on success."""
+    dest_path = Path(dest)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading SAM checkpoint from {url} to {dest_path} ...")
+    try:
+        with urllib.request.urlopen(url) as r:
+            total = r.getheader('Content-Length')
+            if total is None:
+                # Unknown size
+                with open(dest_path, 'wb') as f:
+                    shutil.copyfileobj(r, f)
+            else:
+                total = int(total.strip())
+                downloaded = 0
+                chunk_size = 1024 * 1024
+                with open(dest_path, 'wb') as f:
+                    while True:
+                        chunk = r.read(chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        pct = downloaded * 100 / total
+                        sys.stdout.write(f"\r  {pct:.1f}% ({downloaded/1e6:.1f}/{total/1e6:.1f} MB)")
+                        sys.stdout.flush()
+                print()
+        print("Download complete")
+        return True
+    except Exception as e:
+        print(f"  Download failed: {e}")
+        return False
 
 class SAMZODProcessor:
     """Process ZOD dataset using SAM for semantic segmentation"""
@@ -80,11 +119,12 @@ class SAMZODProcessor:
         """Initialize SAM model"""
         if not SAM_AVAILABLE:
             return
-        
+        # Ensure checkpoint exists, download if missing
         if not Path(self.sam_checkpoint).exists():
             print(f"SAM checkpoint not found: {self.sam_checkpoint}")
-            print("Download from: https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth")
-            return
+            if not _download_file(SAM_DOWNLOAD_URL, self.sam_checkpoint):
+                print("Failed to obtain SAM checkpoint — SAM will be disabled.")
+                return
         
         try:
             # Determine model type from checkpoint name
@@ -384,7 +424,7 @@ def main():
         print("Please install SAM: pip install segment-anything")
         return
 
-    dataset_root = "../data_zod"  # Adjust path as needed
+    dataset_root = "./data"  # Adjust path as needed
     sam_checkpoint = "models/sam_vit_h_4b8939.pth"  # Make sure this file exists
     output_dir = "output_clft"
     num_frames = None  # Process all frames (set to number to limit, e.g., 5 for testing)
@@ -395,12 +435,12 @@ def main():
     print(f"  Output: {output_dir}")
     print(f"  Frames to process: {'All available' if num_frames is None else num_frames}")
     
-    # Check if SAM checkpoint exists
+    # Check if SAM checkpoint exists and attempt download
     if not Path(sam_checkpoint).exists():
         print(f"\nSAM checkpoint not found: {sam_checkpoint}")
-        print("Download it from:")
-        print("https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth")
-        return
+        if not _download_file(SAM_DOWNLOAD_URL, sam_checkpoint):
+            print("Could not download SAM checkpoint. Aborting.")
+            return
     
     # Initialize processor
     processor = SAMZODProcessor(dataset_root, sam_checkpoint)

@@ -354,7 +354,7 @@ class ZODToCLFT:
 def main():
     """Main function - processes ALL 12 frames in the ZOD mini dataset"""
 
-    dataset_root = "../data_zod"
+    dataset_root = "./data"
     output_dir = "output_clft"
     max_frames = None  # Process ALL available frames (12 total)
     

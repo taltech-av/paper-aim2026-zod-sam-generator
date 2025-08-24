@@ -5,7 +5,7 @@ import numpy as np
 import os
 from PIL import Image
 
-def initialize_zod_frames(dataset_root: str = "../data_zod", version: str = "mini") -> ZodFrames:
+def initialize_zod_frames(dataset_root: str = "./data", version: str = "mini") -> ZodFrames:
     """
     Initialize ZodFrames object with specified dataset root and version.
     
@@ -96,7 +96,7 @@ def main():
     4. Save LiDAR visualizations to output directory
     """
     # Configuration variables
-    dataset_root = "../data_zod"  # your local path to zod
+    dataset_root = "./data"  # your local path to zod
     version = "mini"  # "mini" or "full"
     output_dir = '/workspace/output/lidar'
     
