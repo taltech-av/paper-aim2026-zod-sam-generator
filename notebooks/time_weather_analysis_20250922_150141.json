@@ -1,0 +1,142 @@
+{
+  "combination_counts": {
+    "night_cloudy": 11511,
+    "night_rain": 3161,
+    "day_cloudy": 45630,
+    "day_rain": 12003,
+    "day_clear": 16506,
+    "twilight_cloudy": 2127,
+    "day_fog": 1200,
+    "night_clear": 3373,
+    "night_snow": 162,
+    "day_windy": 285,
+    "twilight_fog": 279,
+    "day_snow": 1722,
+    "night_windy": 161,
+    "night_fog": 638,
+    "twilight_clear": 561,
+    "twilight_rain": 552,
+    "twilight_windy": 41,
+    "twilight_snow": 88
+  },
+  "detailed_statistics": {
+    "time_of_day_counts": {
+      "night": 19006,
+      "day": 77346,
+      "twilight": 3648
+    },
+    "weather_counts": {
+      "cloudy": 59268,
+      "rain": 15716,
+      "clear": 20440,
+      "fog": 2117,
+      "snow": 1972,
+      "windy": 487
+    },
+    "country_counts": {
+      "unknown": 100000
+    },
+    "city_counts": {
+      "unknown": 100000
+    },
+    "frame_years": {
+      "unknown": 100000
+    },
+    "missing_fields": {},
+    "seasonal_patterns": {
+      "unknown": {
+        "cloudy": 59268,
+        "rain": 15716,
+        "clear": 20440,
+        "fog": 2117,
+        "snow": 1972,
+        "windy": 487
+      }
+    },
+    "monthly_patterns": {},
+    "hourly_patterns": {},
+    "geographic_clusters": {
+      "unknown": {
+        "cloudy": 59268,
+        "rain": 15716,
+        "clear": 20440,
+        "fog": 2117,
+        "snow": 1972,
+        "windy": 487
+      }
+    },
+    "weather_transitions": {
+      "cloudy->rain": 9422,
+      "rain->cloudy": 9346,
+      "cloudy->cloudy": 35069,
+      "cloudy->clear": 12085,
+      "clear->cloudy": 12155,
+      "rain->fog": 326,
+      "fog->rain": 336,
+      "cloudy->snow": 1156,
+      "snow->cloudy": 1172,
+      "clear->rain": 3147,
+      "rain->rain": 2430,
+      "rain->clear": 3215,
+      "clear->clear": 4172,
+      "cloudy->windy": 289,
+      "windy->rain": 74,
+      "cloudy->fog": 1246,
+      "fog->cloudy": 1232,
+      "fog->snow": 34,
+      "clear->snow": 401,
+      "fog->clear": 466,
+      "windy->cloudy": 293,
+      "rain->snow": 326,
+      "snow->clear": 399,
+      "snow->rain": 307,
+      "clear->fog": 465,
+      "fog->fog": 36,
+      "windy->clear": 103,
+      "fog->windy": 13,
+      "clear->windy": 100,
+      "rain->windy": 73,
+      "snow->snow": 46,
+      "windy->fog": 7,
+      "windy->snow": 9,
+      "snow->fog": 37,
+      "snow->windy": 11,
+      "windy->windy": 1
+    },
+    "challenging_conditions": {
+      "night_driving": 15045,
+      "wet_road+night_driving+night_adverse_weather": 3161,
+      "normal": 65150,
+      "wet_road": 12555,
+      "low_visibility": 1479,
+      "winter_driving+night_driving+night_adverse_weather": 162,
+      "winter_driving": 1810,
+      "low_visibility+night_driving+night_adverse_weather": 638
+    },
+    "extreme_weather_events": {
+      "fog": 2117,
+      "snow": 1972
+    },
+    "daylight_quality": {
+      "night_driving": 19006,
+      "optimal": 16506
+    },
+    "road_surface_conditions": {
+      "dry": 79708,
+      "wet_slippery": 17688
+    },
+    "visibility_analysis": {
+      "total_samples": 0,
+      "average_visibility": 0,
+      "visibility_by_weather": {}
+    }
+  },
+  "summary": {
+    "total_files_found": 100000,
+    "total_files_processed": 100000,
+    "total_files_failed": 0,
+    "analysis_duration": "0:00:04",
+    "analysis_timestamp": "2025-09-22T15:01:41.313660",
+    "dataset_path": "/media/tom/ml/zod-data/single_frames"
+  }
+}
