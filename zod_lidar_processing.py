@@ -98,7 +98,7 @@ def main():
     # Configuration variables
     dataset_root = "./data"  # your local path to zod
     version = "mini"  # "mini" or "full"
-    output_dir = '/workspace/output/lidar'
+    output_dir = './output/lidar'
     
     # Initialize ZodFrames
     zod_frames = initialize_zod_frames(dataset_root, version)

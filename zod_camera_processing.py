@@ -126,7 +126,7 @@ def process_frame_with_annotations(zod_frames: ZodFrames, frame_id: str) -> Imag
 def main():
     dataset_root = "./data"  # your local path to zod
     version = "mini"  # "mini" or "full"
-    output_dir = '/workspace/output/camera'
+    output_dir = './output/camera'
     
     # Initialize ZodFrames
     zod_frames = initialize_zod_frames(dataset_root, version)

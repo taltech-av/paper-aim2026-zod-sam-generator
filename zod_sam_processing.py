@@ -21,14 +21,25 @@ from zod import ObjectAnnotation
 from zod.constants import Camera, Anonymization, AnnotationProject
 
 # SAM imports
+TORCH_AVAILABLE = False
+SAM_AVAILABLE = False
+
 try:
-    from segment_anything import SamPredictor, sam_model_registry
     import torch
-    SAM_AVAILABLE = True
-    print("SAM available")
-except ImportError:
-    SAM_AVAILABLE = False
-    print("SAM not available. Install with: pip install segment-anything")
+    TORCH_AVAILABLE = True
+except ImportError as torch_import_error:
+    print("PyTorch not available. Install it first, for example:")
+    print("  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121")
+    print(f"Details: {torch_import_error}")
+
+if TORCH_AVAILABLE:
+    try:
+        from segment_anything import SamPredictor, sam_model_registry
+        SAM_AVAILABLE = True
+        print("SAM available")
+    except ImportError as sam_import_error:
+        print("segment-anything not available. Install with: pip install segment-anything")
+        print(f"Details: {sam_import_error}")
 
 # URL for the SAM checkpoint
 SAM_DOWNLOAD_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
