@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import cv2
 from PIL import Image
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import Dict, Optional, Tuple
 
 # ZOD imports
 from zod import ZodFrames
@@ -23,21 +23,52 @@ from zod.data_classes.geometry import Pose
 class ZODToCLFT:
     """Convert ZOD LiDAR and camera data to proper CLFT format"""
     
-    def __init__(self, dataset_root, output_dir="output_clft_fixed"):
+    def __init__(
+        self,
+        dataset_root,
+        output_dir="output_clft_fixed",
+        version="mini",
+        zod_frames: Optional[ZodFrames] = None,
+        visualization_subdir: str = "visualizations",
+        target_image_size: Optional[int] = None,
+        verbose: bool = False,
+        *,
+        camera_subdir: str = "camera",
+        lidar_subdir: str = "lidar",
+        deduplicate_points: bool = True,
+    ):
         self.dataset_root = dataset_root
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+        self.dataset_version = version
+        self.visualization_subdir = visualization_subdir
+        self.target_image_size = target_image_size
+        self.verbose = verbose
+        self.camera_subdir = camera_subdir
+        self.lidar_subdir = lidar_subdir
+        self.deduplicate_points = deduplicate_points
+
+        self.visualization_dir = self.output_dir / self.visualization_subdir
+        self.camera_dir = self.output_dir / self.camera_subdir
+        self.lidar_dir = self.output_dir / self.lidar_subdir
+
         # Initialize ZOD dataset
-        self.zod_frames = ZodFrames(dataset_root=dataset_root, version="mini")
+        if zod_frames is not None:
+            self.zod_frames = zod_frames
+        elif dataset_root is not None:
+            self.zod_frames = ZodFrames(dataset_root=dataset_root, version=version)
+        else:
+            self.zod_frames = None
         
         # Camera mapping
         self.camera_mapping = {
             Camera.FRONT: 0,  # CLFT uses 0-based indexing
         }
         
-        print(f"Initialized ZOD to CLFT converter")
-        print(f"Dataset: {len(self.zod_frames)} frames available")
+        if self.verbose:
+            print("Initialized ZOD to CLFT converter")
+            print(f"Dataset version: {self.dataset_version}")
+            print(f"Frames available: {len(self.zod_frames)}")
 
     def get_lidar_points(self, zod_frame):
         """Extract LiDAR points from ZOD frame"""
@@ -64,7 +95,8 @@ class ZODToCLFT:
             
             if isinstance(points, np.ndarray) and points.ndim == 2 and points.shape[1] >= 3:
                 points_3d = points[:, :3].astype(np.float32)  # ✅ Convert to float32
-                print(f"LiDAR points: {len(points_3d):,} points")
+                if self.verbose:
+                    print(f"LiDAR points: {len(points_3d):,} points")
                 return points_3d
             else:
                 return None
@@ -121,7 +153,8 @@ class ZODToCLFT:
             valid_points_2d = xy_array[valid_mask]
             valid_points_3d = camera_data_fov[valid_mask]
             
-            print(f"    Valid projections: {len(valid_points_2d):,}")
+            if self.verbose:
+                print(f"    Valid projections: {len(valid_points_2d):,}")
             
             return valid_points_2d, valid_points_3d
             
@@ -132,8 +165,13 @@ class ZODToCLFT:
     def create_clft_data(self, frame_id):
         """Create data in proper CLFT format"""
         try:
-            print(f"\nProcessing frame {frame_id}...")
-            print(f"  Frame ID type: {type(frame_id)}")
+            if self.verbose:
+                print(f"\nProcessing frame {frame_id}...")
+                print(f"  Frame ID type: {type(frame_id)}")
+            if self.zod_frames is None:
+                raise RuntimeError(
+                    "ZOD frames are not loaded; cannot create CLFT data without dataset access"
+                )
             
             zod_frame = self.zod_frames[frame_id]
             points_3d = self.get_lidar_points(zod_frame)
@@ -149,7 +187,8 @@ class ZODToCLFT:
             all_class_instances = []
             
             for camera_name, camera_id in self.camera_mapping.items():
-                print(f"  Processing {camera_name} (ID: {camera_id})...")
+                if self.verbose:
+                    print(f"  Processing {camera_name} (ID: {camera_id})...")
                 
                 points_2d, points_3d_valid = self.project_lidar_to_camera_zod_method(
                     points_3d, calibration, camera_name
@@ -179,7 +218,8 @@ class ZODToCLFT:
                     all_class_instances.append(class_instance)
             
             if not all_3d_points:
-                print("  No valid projections found")
+                if self.verbose:
+                    print("  No valid projections found")
                 return None
             
             # Combine all data
@@ -187,7 +227,22 @@ class ZODToCLFT:
             combined_camera_coords = np.vstack(all_camera_coords)
             combined_class_instances = np.vstack(all_class_instances)
             
-            print(f"  Total points: {len(combined_3d_points):,}")
+            if self.verbose:
+                print(f"  Total points: {len(combined_3d_points):,}")
+
+            if self.deduplicate_points:
+                (
+                    combined_3d_points,
+                    combined_camera_coords,
+                    combined_class_instances,
+                    removed,
+                ) = self._deduplicate_entries(
+                    combined_3d_points,
+                    combined_camera_coords,
+                    combined_class_instances,
+                )
+                if removed and self.verbose:
+                    print(f"  Removed {removed:,} duplicate camera projections")
             
             # Create CLFT-compliant data structure
             clft_data = {
@@ -203,30 +258,67 @@ class ZODToCLFT:
             traceback.print_exc()
             return None
 
+    def _deduplicate_entries(
+        self,
+        points_3d: np.ndarray,
+        camera_coords: np.ndarray,
+        class_instance: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+        """Remove duplicate camera projections, keeping the closest depth per pixel."""
+
+        if len(points_3d) == 0:
+            return points_3d, camera_coords, class_instance, 0
+
+        camera_coords = np.ascontiguousarray(camera_coords)
+        points_3d = np.ascontiguousarray(points_3d)
+        class_instance = np.ascontiguousarray(class_instance)
+
+        sort_order = np.lexsort(
+            (
+                points_3d[:, 2],
+                camera_coords[:, 2],
+                camera_coords[:, 1],
+                camera_coords[:, 0],
+            )
+        )
+
+        camera_sorted = camera_coords[sort_order]
+        camera_view = camera_sorted.view(
+            np.dtype((np.void, camera_sorted.dtype.itemsize * camera_sorted.shape[1]))
+        )
+        _, unique_idx = np.unique(camera_view, return_index=True)
+
+        keep_indices = np.sort(sort_order[unique_idx])
+
+        dedup_points = points_3d[keep_indices]
+        dedup_camera = camera_coords[keep_indices]
+        dedup_class = class_instance[keep_indices]
+
+        removed = len(points_3d) - len(dedup_points)
+        return dedup_points, dedup_camera, dedup_class, int(removed)
+
     def save_clft_data(self, clft_data, frame_id, zod_frame=None):
         """Save data in proper CLFT format"""
         try:
             # Create lidar output directory
-            lidar_dir = self.output_dir / "lidar"
-            lidar_dir.mkdir(parents=True, exist_ok=True)
+            self.lidar_dir.mkdir(parents=True, exist_ok=True)
             
-            # Debug: Show frame_id type and value
-            print(f"    Saving frame_id: {frame_id} (type: {type(frame_id)})")
+            if self.verbose:
+                print(f"    Saving frame_id: {frame_id} (type: {type(frame_id)})")
             
             # Save with proper CLFT filename format
-            output_path = lidar_dir / f"frame_{frame_id}.pkl"
+            output_path = self.lidar_dir / f"frame_{frame_id}.pkl"
             
             with open(output_path, 'wb') as f:
                 pickle.dump(clft_data, f)
             
-            print(f" Saved CLFT format: {output_path}")
-            
-            # Verify the saved format
-            self.verify_clft_format(output_path)
+            if self.verbose:
+                print(f" Saved CLFT format: {output_path}")
+                self.verify_clft_format(output_path)
             
             # Create visualization if zod_frame is provided
             if zod_frame is not None:
-                self.create_visualization(frame_id, clft_data, zod_frame)
+                self.create_visualization(frame_id, clft_data, zod_frame=zod_frame)
             
             return True
             
@@ -262,6 +354,9 @@ class ZODToCLFT:
             max_frames: Maximum number of frames to process. 
                        If None, processes all available frames (12 total)
         """
+
+        if self.zod_frames is None:
+            raise RuntimeError("ZOD frames are required to process the dataset")
         
         # Get frame IDs
         train_ids = list(self.zod_frames.get_split("train"))
@@ -303,17 +398,75 @@ class ZODToCLFT:
         
         return success_count
 
-    def create_visualization(self, frame_id, clft_data, zod_frame):
+    def _load_overlay_base_image(
+        self,
+        frame_id: str,
+        zod_frame=None,
+        camera_image_path: Optional[Path] = None,
+    ) -> Image.Image:
+        """Load a camera image for visualization from ZOD frame or disk."""
+        attempts = []
+
+        if zod_frame is not None:
+            anonymization_attempts = [Anonymization.DNAT, Anonymization.BLUR, None]
+            for anonymization in anonymization_attempts:
+                try:
+                    if anonymization is None:
+                        return zod_frame.get_image()
+                    return zod_frame.get_image(anonymization)
+                except FileNotFoundError as exc:
+                    attempts.append(f"{anonymization or 'DEFAULT'}: {exc}")
+                except Exception as exc:  # noqa: BLE001 - ensure full context for debugging
+                    attempts.append(f"{anonymization or 'DEFAULT'}: {exc}")
+
+        candidate_paths = []
+        if camera_image_path is not None:
+            candidate_paths.append(Path(camera_image_path))
+
+        candidate_names = [
+            f"frame_{frame_id}.png",
+            f"camera_{frame_id}.png",
+            f"frame_{frame_id}.jpg",
+            f"camera_{frame_id}.jpg",
+            f"{frame_id}.png",
+            f"{frame_id}.jpg",
+        ]
+        candidate_paths.extend(self.camera_dir / name for name in candidate_names)
+
+        for candidate in candidate_paths:
+            try:
+                with Image.open(candidate) as img:
+                    return img.convert("RGB")
+            except FileNotFoundError as exc:
+                attempts.append(f"{candidate}: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                attempts.append(f"{candidate}: {exc}")
+
+        attempt_msg = "; ".join(attempts) if attempts else "no sources attempted"
+        raise FileNotFoundError(
+            f"Unable to load camera image for frame {frame_id}. Attempts: {attempt_msg}"
+        )
+
+    def create_visualization(
+        self,
+        frame_id,
+        clft_data,
+        zod_frame=None,
+        camera_image_path: Optional[Path] = None,
+    ):
         """Create clean visualization for CLFT data processing"""
         try:
-            print(f"  Creating visualization for frame {frame_id}...")
-            
-            # Create visualization directory
-            viz_dir = self.output_dir / "visualizations"
+            if self.verbose:
+                print(f"  Creating visualization for frame {frame_id}...")
+
+            viz_dir = self.visualization_dir
             viz_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Get camera image
-            image_pil = zod_frame.get_image(Anonymization.DNAT)
+
+            image_pil = self._load_overlay_base_image(
+                frame_id,
+                zod_frame=zod_frame,
+                camera_image_path=camera_image_path,
+            )
             image_np = np.array(image_pil)
             
             # Extract data from CLFT format
@@ -325,7 +478,7 @@ class ZODToCLFT:
             
             # Show camera image with LiDAR points overlaid
             ax.imshow(image_np)
-              # Color points by depth
+            # Color points by depth
             depths = points_3d[:, 2]  # Z coordinates
             ax.scatter(
                 camera_coords[:, 1],  # X pixel coordinates
@@ -340,16 +493,50 @@ class ZODToCLFT:
             ax.axis('off')
             
             # Save with tight layout and no padding
-            viz_path = viz_dir / f"frame_{frame_id}_pickle_overlay.png"
+            viz_path = viz_dir / f"frame_{frame_id}_lidar_overlay.png"
             plt.savefig(viz_path, dpi=150, bbox_inches='tight', pad_inches=0)
-            plt.close()
-            
-            print(f"    Visualization saved: {viz_path}")
+            plt.close(fig)
+
+            if self.target_image_size is not None:
+                with Image.open(viz_path) as viz_img:
+                    if viz_img.size != (self.target_image_size, self.target_image_size):
+                        resized = viz_img.resize(
+                            (self.target_image_size, self.target_image_size),
+                            resample=Image.BILINEAR,
+                        )
+                        resized.save(viz_path, format="PNG", optimize=True)
+            if self.verbose:
+                print(f"    Visualization saved: {viz_path}")
             return True
             
         except Exception as e:
             print(f"    Error creating visualization: {e}")
             return False
+
+    def create_visualization_from_artifacts(
+        self,
+        frame_id: str,
+        camera_path: Optional[Path] = None,
+        lidar_path: Optional[Path] = None,
+    ) -> bool:
+        """Render a LiDAR overlay using previously saved artefacts."""
+
+        lidar_file = Path(lidar_path) if lidar_path is not None else self.lidar_dir / f"frame_{frame_id}.pkl"
+        if not lidar_file.exists():
+            if self.verbose:
+                print(f"  Missing CLFT pickle for frame {frame_id}: {lidar_file}")
+            return False
+
+        with lidar_file.open('rb') as f:
+            clft_data = pickle.load(f)
+
+        source_camera_path = Path(camera_path) if camera_path is not None else self.camera_dir / f"frame_{frame_id}.png"
+        return self.create_visualization(
+            frame_id,
+            clft_data,
+            zod_frame=None,
+            camera_image_path=source_camera_path,
+        )
 
 def main():
     """Main function - processes ALL 12 frames in the ZOD mini dataset"""

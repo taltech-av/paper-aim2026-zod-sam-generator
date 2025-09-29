@@ -10,10 +10,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional
 import urllib.request
 import shutil
 import sys
+import contextlib
 
 # ZOD imports
 from zod import ZodFrames
@@ -42,7 +43,22 @@ if TORCH_AVAILABLE:
         print(f"Details: {sam_import_error}")
 
 # URL for the SAM checkpoint
-SAM_DOWNLOAD_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
+SAM_CHECKPOINT_SPECS: Dict[str, Dict[str, str]] = {
+    "vit_h": {
+        "filename": "sam_vit_h_4b8939.pth",
+        "url": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth",
+    },
+    "vit_l": {
+        "filename": "sam_vit_l_0b3195.pth",
+        "url": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth",
+    },
+    "vit_b": {
+        "filename": "sam_vit_b_01ec64.pth",
+        "url": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
+    },
+}
+
+DEFAULT_SAM_MODEL_TYPE = "vit_h"
 
 def _download_file(url: str, dest: str) -> bool:
     """Download url to dest (streaming). Returns True on success."""
@@ -80,9 +96,30 @@ def _download_file(url: str, dest: str) -> bool:
 class SAMZODProcessor:
     """Process ZOD dataset using SAM for semantic segmentation"""
     
-    def __init__(self, dataset_root, sam_checkpoint="sam_vit_h_4b8939.pth"):
+    def __init__(
+        self,
+        dataset_root,
+        sam_checkpoint: Optional[str] = None,
+        target_image_size: Optional[int] = None,
+        verbose: bool = False,
+        save_camera_image: bool = True,
+        use_mixed_precision: bool = True,
+        deduplicate_boxes: bool = True,
+        sam_model_type: Optional[str] = None,
+    ):
         self.dataset_root = dataset_root
+        if sam_checkpoint is None:
+            default_filename = SAM_CHECKPOINT_SPECS[DEFAULT_SAM_MODEL_TYPE]["filename"]
+            sam_checkpoint = str(Path("models") / default_filename)
         self.sam_checkpoint = sam_checkpoint
+        self.target_image_size = target_image_size
+        self.verbose = verbose
+        self.save_camera_image = save_camera_image
+        self.use_mixed_precision = use_mixed_precision
+        self.deduplicate_boxes = deduplicate_boxes
+        self.sam_model_type = self._normalise_model_type(
+            sam_model_type or self._infer_model_type_from_checkpoint(self.sam_checkpoint)
+        )
         
         # Class mapping for semantic segmentation
         self.class_mapping = {
@@ -95,7 +132,7 @@ class SAMZODProcessor:
             'VulnerableVehicle': 3,
             'Truck': 1,
             'Bus': 1,
-            'Motorcycle': 1,
+            'Motorcycle': 2,
             'Bicycle': 2,
         }
         
@@ -118,6 +155,25 @@ class SAMZODProcessor:
         self._initialize_zod()
         self._initialize_sam()
     
+    def _normalise_model_type(self, model_type: Optional[str]) -> str:
+        if not model_type:
+            return DEFAULT_SAM_MODEL_TYPE
+        model_type = model_type.lower()
+        if model_type in SAM_CHECKPOINT_SPECS:
+            return model_type
+        if self.verbose:
+            print(f"Unknown SAM model type '{model_type}', falling back to {DEFAULT_SAM_MODEL_TYPE}")
+        return DEFAULT_SAM_MODEL_TYPE
+
+    def _infer_model_type_from_checkpoint(self, checkpoint_path: Optional[str]) -> Optional[str]:
+        if not checkpoint_path:
+            return None
+        name = Path(checkpoint_path).name.lower()
+        for model_type in SAM_CHECKPOINT_SPECS:
+            if model_type in name:
+                return model_type
+        return None
+
     def _initialize_zod(self):
         """Initialize ZOD dataset"""
         try:
@@ -130,46 +186,80 @@ class SAMZODProcessor:
         """Initialize SAM model"""
         if not SAM_AVAILABLE:
             return
-        # Ensure checkpoint exists, download if missing
-        if not Path(self.sam_checkpoint).exists():
-            print(f"SAM checkpoint not found: {self.sam_checkpoint}")
-            if not _download_file(SAM_DOWNLOAD_URL, self.sam_checkpoint):
+
+        checkpoint_path = Path(self.sam_checkpoint)
+        model_type = self.sam_model_type or DEFAULT_SAM_MODEL_TYPE
+
+        if not checkpoint_path.exists():
+            spec = SAM_CHECKPOINT_SPECS.get(model_type, SAM_CHECKPOINT_SPECS[DEFAULT_SAM_MODEL_TYPE])
+            print(f"SAM checkpoint not found: {checkpoint_path}")
+            if checkpoint_path.is_dir():
+                checkpoint_path = checkpoint_path / spec["filename"]
+            else:
+                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                if checkpoint_path.name == "":
+                    checkpoint_path = checkpoint_path / spec["filename"]
+
+            if not _download_file(spec["url"], str(checkpoint_path)):
                 print("Failed to obtain SAM checkpoint — SAM will be disabled.")
                 return
-        
+
+        inferred_model = self._infer_model_type_from_checkpoint(checkpoint_path)
+        if inferred_model is not None:
+            model_type = inferred_model
+        model_type = self._normalise_model_type(model_type)
+
         try:
-            # Determine model type from checkpoint name
-            if "vit_h" in self.sam_checkpoint:
-                model_type = "vit_h"
-            elif "vit_l" in self.sam_checkpoint:
-                model_type = "vit_l"
-            elif "vit_b" in self.sam_checkpoint:
-                model_type = "vit_b"
-            else:
-                model_type = "vit_h"  # default
-            
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            sam = sam_model_registry[model_type](checkpoint=self.sam_checkpoint)
+            sam = sam_model_registry[model_type](checkpoint=str(checkpoint_path))
             sam.to(device=device)
             self.sam_predictor = SamPredictor(sam)
-            
+            self.sam_model_type = model_type
+            self.sam_checkpoint = str(checkpoint_path)
             print(f"SAM model loaded: {model_type} on {device}")
-            
+
         except Exception as e:
             print(f"SAM loading failed: {e}")
+
+    def _get_image_with_fallback(self, zod_frame):
+        """Return a camera image, falling back if DNAT assets are missing."""
+        attempts = [Anonymization.DNAT, Anonymization.BLUR]
+        errors = []
+
+        for anonymization in attempts:
+            try:
+                return zod_frame.get_image(anonymization)
+            except FileNotFoundError as exc:
+                errors.append(f"{anonymization.name}: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{anonymization.name}: {exc}")
+
+        try:
+            return zod_frame.get_image()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"DEFAULT: {exc}")
+
+        frame_identifier = getattr(zod_frame.info, "identifier", "unknown")
+        error_msg = "; ".join(errors) if errors else "no attempts made"
+        raise FileNotFoundError(
+            f"Unable to load camera image for frame {frame_identifier}. Attempts: {error_msg}"
+        )
     def get_2d_boxes_from_annotations(self, annotations: List[ObjectAnnotation], calibration, image_shape):
         """Extract 2D bounding boxes from ZOD annotations (3D -> 2D projection if needed)"""
         boxes_2d = []
         
-        print(f"  Processing {len(annotations)} annotations...")
+        if self.verbose:
+            print(f"  Processing {len(annotations)} annotations...")
         
         for i, annotation in enumerate(annotations):
             category = annotation.name
             class_id = self.class_mapping.get(category, 0)
-            print(f"    Annotation {i+1}: category='{category}', class_id={class_id}")
+            if self.verbose:
+                print(f"    Annotation {i+1}: category='{category}', class_id={class_id}")
             
             if class_id == 0:  # Skip unknown classes
-                print(f"      Skipping unknown class: {category}")
+                if self.verbose:
+                    print(f"      Skipping unknown class: {category}")
                 continue
             
             # Try to get 2D box directly
@@ -181,7 +271,8 @@ class SAMZODProcessor:
                     # corners[0] is top-left, corners[2] is bottom-right
                     x1, y1 = int(corners[0][0]), int(corners[0][1])
                     x2, y2 = int(corners[2][0]), int(corners[2][1])
-                    print(f"      Found 2D box: ({x1},{y1}) to ({x2},{y2})")
+                    if self.verbose:
+                        print(f"      Found 2D box: ({x1},{y1}) to ({x2},{y2})")
                     
                 except Exception as e:
                     print(f"      Error processing 2D box: {e}")
@@ -189,7 +280,8 @@ class SAMZODProcessor:
                 
             elif hasattr(annotation, 'box3d') and annotation.box3d is not None:
                 # Project 3D box to 2D
-                print(f"      Attempting 3D to 2D projection...")
+                if self.verbose:
+                    print(f"      Attempting 3D to 2D projection...")
                 try:
                     box3d = annotation.box3d
                     # Get 3D box corners
@@ -211,17 +303,21 @@ class SAMZODProcessor:
                         # Get bounding rectangle
                         x1, y1 = np.min(corners_2d, axis=0).astype(int)
                         x2, y2 = np.max(corners_2d, axis=0).astype(int)
-                        print(f"      Projected 3D->2D: ({x1},{y1}) to ({x2},{y2})")
+                        if self.verbose:
+                            print(f"      Projected 3D->2D: ({x1},{y1}) to ({x2},{y2})")
                         
                     else:
-                        print(f"      No camera calibration available")
+                        if self.verbose:
+                            print("      No camera calibration available")
                         continue  # Skip if no calibration
                         
                 except Exception as e:
-                    print(f"      Failed to project 3D box: {e}")
+                    if self.verbose:
+                        print(f"      Failed to project 3D box: {e}")
                     continue
             else:
-                print(f"      No 2D or 3D box found")
+                if self.verbose:
+                    print("      No 2D or 3D box found")
                 continue  # Skip if no box info
             
             # Ensure box is within image bounds
@@ -246,28 +342,61 @@ class SAMZODProcessor:
         
         height, width = image.shape[:2]
         mask = np.zeros((height, width), dtype=np.uint8)
-        
+
+        # Ensure contiguous memory for SAM encoder
+        image = np.ascontiguousarray(image)
+
         # Set image for SAM
         self.sam_predictor.set_image(image)
-        
+
         stats = {'success': 0, 'failed': 0}
-        
-        for box_info in boxes_2d:
+
+        if self.deduplicate_boxes:
+            unique_boxes: List[dict] = []
+            seen = set()
+            for box_info in boxes_2d:
+                bbox = box_info['bbox']
+                key = (box_info['class_id'], bbox[0], bbox[1], bbox[2], bbox[3])
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique_boxes.append(box_info)
+            boxes_iter = unique_boxes
+        else:
+            boxes_iter = boxes_2d
+
+        for box_info in boxes_iter:
             try:
                 bbox = box_info['bbox']
                 class_id = box_info['class_id']
-                
+
                 # Create input box for SAM
-                input_box = np.array(bbox)
-                
+                input_box = np.array(bbox, dtype=np.float32)
+
                 # Generate mask
-                masks, scores, logits = self.sam_predictor.predict(
-                    point_coords=None,
-                    point_labels=None,
-                    box=input_box[None, :],
-                    multimask_output=False,
-                )
-                
+                if TORCH_AVAILABLE:
+                    no_grad_ctx = torch.no_grad()
+                else:
+                    no_grad_ctx = contextlib.nullcontext()
+
+                if (
+                    self.use_mixed_precision
+                    and TORCH_AVAILABLE
+                    and torch.cuda.is_available()
+                ):
+                    precision_ctx = torch.cuda.amp.autocast()
+                else:
+                    precision_ctx = contextlib.nullcontext()
+
+                with no_grad_ctx:
+                    with precision_ctx:
+                        masks, scores, logits = self.sam_predictor.predict(
+                            point_coords=None,
+                            point_labels=None,
+                            box=input_box[None, :],
+                            multimask_output=False,
+                        )
+
                 # Use the generated mask
                 if len(masks) > 0:
                     sam_mask = masks[0].astype(np.uint8)
@@ -278,14 +407,15 @@ class SAMZODProcessor:
                     x1, y1, x2, y2 = bbox
                     mask[y1:y2, x1:x2] = class_id
                     stats['failed'] += 1
-                    
+
             except Exception as e:
-                print(f"SAM processing failed for box: {e}")
+                if self.verbose:
+                    print(f"SAM processing failed for box: {e}")
                 # Fallback to simple box fill
                 x1, y1, x2, y2 = box_info['bbox']
                 mask[y1:y2, x1:x2] = box_info['class_id']
                 stats['failed'] += 1
-        
+
         return mask, stats
     
     def process_frame(self, frame_id, output_dir):
@@ -294,8 +424,7 @@ class SAMZODProcessor:
             # Get frame
             zod_frame = self.zod_frames[frame_id]
             
-            # Get image
-            image_pil = zod_frame.get_image(Anonymization.DNAT)
+            image_pil = self._get_image_with_fallback(zod_frame)
             image_np = np.array(image_pil)
             
             # Get object annotations
@@ -309,10 +438,12 @@ class SAMZODProcessor:
             )
             
             if not boxes_2d:
-                print(f"  No valid boxes found for frame {frame_id}")
+                if self.verbose:
+                    print(f"  No valid boxes found for frame {frame_id}")
                 return False
-            
-            print(f"  Found {len(boxes_2d)} objects")
+
+            if self.verbose:
+                print(f"  Found {len(boxes_2d)} objects")
             
             # Create SAM segmentation mask
             seg_mask, stats = self.create_sam_mask(image_np, boxes_2d)
@@ -321,7 +452,8 @@ class SAMZODProcessor:
                 print(f"  SAM processing failed for frame {frame_id}")
                 return False
             
-            print(f"  SAM - Success: {stats['success']}, Failed: {stats['failed']}")
+            if self.verbose:
+                print(f"  SAM - Success: {stats['success']}, Failed: {stats['failed']}")
             
             # Save results
             self._save_results(image_np, seg_mask, boxes_2d, frame_id, output_dir, stats)
@@ -336,27 +468,64 @@ class SAMZODProcessor:
         """Save processing results"""
         
         # Create output directories
-        for subdir in ['camera', 'annotation', 'annotation_rgb', 'visualizations']:
+        required_subdirs = ["annotation", "annotation_rgb", "visualizations"]
+        if self.save_camera_image:
+            required_subdirs.append("camera")
+
+        for subdir in required_subdirs:
             Path(output_dir, subdir).mkdir(parents=True, exist_ok=True)
-        
+
         frame_name = f"frame_{frame_id}"
-        
-        # Save original image
-        cv2.imwrite(str(Path(output_dir, 'camera', f'{frame_name}.png')), 
-                   cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-        
-        # Save grayscale mask
-        cv2.imwrite(str(Path(output_dir, 'annotation', f'{frame_name}.png')), mask)
-        
+
+        # Save camera image (resize if requested) only when enabled and missing
+        if self.save_camera_image:
+            camera_path = Path(output_dir, "camera", f"{frame_name}.png")
+            if not camera_path.exists():
+                camera_image = Image.fromarray(image.astype(np.uint8))
+                if self.target_image_size is not None and camera_image.size != (
+                    self.target_image_size,
+                    self.target_image_size,
+                ):
+                    camera_image = camera_image.resize(
+                        (self.target_image_size, self.target_image_size),
+                        resample=Image.BILINEAR,
+                    )
+                camera_image.save(camera_path, format="PNG", optimize=True)
+            elif self.verbose:
+                print(f"  Camera image already exists for {frame_name}, skipping overwrite")
+
+        # Save grayscale mask (nearest-neighbour to preserve labels)
+        mask_image = Image.fromarray(mask.astype(np.uint8))
+        if self.target_image_size is not None and mask_image.size != (
+            self.target_image_size,
+            self.target_image_size,
+        ):
+            mask_image = mask_image.resize(
+                (self.target_image_size, self.target_image_size),
+                resample=Image.NEAREST,
+            )
+        mask_image.save(Path(output_dir, "annotation", f"{frame_name}.png"), format="PNG")
+
         # Save RGB mask (CLFT format)
         rgb_mask = np.zeros((*mask.shape, 3), dtype=np.uint8)
         for class_id in range(self.max_classes):
             class_pixels = mask == class_id
             rgb_mask[class_pixels] = [class_id, 0, 0]
-        
-        cv2.imwrite(str(Path(output_dir, 'annotation_rgb', f'{frame_name}.png')), 
-                   cv2.cvtColor(rgb_mask, cv2.COLOR_RGB2BGR))
-        
+
+        rgb_mask_image = Image.fromarray(rgb_mask)
+        if self.target_image_size is not None and rgb_mask_image.size != (
+            self.target_image_size,
+            self.target_image_size,
+        ):
+            rgb_mask_image = rgb_mask_image.resize(
+                (self.target_image_size, self.target_image_size),
+                resample=Image.NEAREST,
+            )
+        rgb_mask_image.save(
+            Path(output_dir, "annotation_rgb", f"{frame_name}.png"),
+            format="PNG",
+        )
+
         # Create visualization
         self._create_visualization(image, mask, boxes_2d, frame_name, output_dir, stats)
     def _create_visualization(self, image, mask, boxes_2d, frame_name, output_dir, stats):
@@ -364,23 +533,27 @@ class SAMZODProcessor:
         
         # Create SAM overlay
         overlay = image.copy().astype(float)
-        colored_mask = plt.cm.tab10(mask / (self.max_classes-1))[:,:,:3]
+        colored_mask = plt.cm.tab10(mask / (self.max_classes - 1))[:, :, :3]
         mask_alpha = (mask > 0).astype(float) * 0.6
-        
+
         for c in range(3):
-            overlay[:,:,c] = (overlay[:,:,c] * (1 - mask_alpha) + 
-                            colored_mask[:,:,c] * 255 * mask_alpha)
-          # Create single plot with just the overlay
-        fig, ax = plt.subplots(1, 1, figsize=(12, 8))
-        ax.imshow(overlay.astype(np.uint8))
-        ax.axis('off')
-        
-        plt.tight_layout(pad=0.5)
-        
-        # Save visualization
-        viz_path = Path(output_dir, 'visualizations', f'{frame_name}_sam_overlay.png')
-        plt.savefig(viz_path, dpi=150, bbox_inches='tight', pad_inches=0.1)
-        plt.close()
+            overlay[:, :, c] = (
+                overlay[:, :, c] * (1 - mask_alpha)
+                + colored_mask[:, :, c] * 255 * mask_alpha
+            )
+
+        overlay_image = Image.fromarray(overlay.astype(np.uint8))
+        if self.target_image_size is not None and overlay_image.size != (
+            self.target_image_size,
+            self.target_image_size,
+        ):
+            overlay_image = overlay_image.resize(
+                (self.target_image_size, self.target_image_size),
+                resample=Image.BILINEAR,
+            )
+
+        viz_path = Path(output_dir, "visualizations", f"{frame_name}_sam_overlay.png")
+        overlay_image.save(viz_path, format="PNG", optimize=True)
     
     def process_dataset(self, num_frames=5, output_dir="output_clft"):
         """Process dataset with SAM"""
@@ -436,25 +609,33 @@ def main():
         return
 
     dataset_root = "./data"  # Adjust path as needed
-    sam_checkpoint = "models/sam_vit_h_4b8939.pth"  # Make sure this file exists
+    sam_model_type = DEFAULT_SAM_MODEL_TYPE  # Change to 'vit_b' for faster, lower-memory inference
+    sam_spec = SAM_CHECKPOINT_SPECS[sam_model_type]
+    sam_checkpoint_path = Path("models") / sam_spec["filename"]
+    sam_checkpoint = str(sam_checkpoint_path)
     output_dir = "output_clft"
     num_frames = None  # Process all frames (set to number to limit, e.g., 5 for testing)
     
     print(f"\nConfiguration:")
     print(f"  Dataset: {dataset_root}")
-    print(f"  SAM model: {sam_checkpoint}")
+    print(f"  SAM model: {sam_model_type} ({sam_checkpoint})")
     print(f"  Output: {output_dir}")
     print(f"  Frames to process: {'All available' if num_frames is None else num_frames}")
     
     # Check if SAM checkpoint exists and attempt download
-    if not Path(sam_checkpoint).exists():
+    if not sam_checkpoint_path.exists():
         print(f"\nSAM checkpoint not found: {sam_checkpoint}")
-        if not _download_file(SAM_DOWNLOAD_URL, sam_checkpoint):
+        sam_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        if not _download_file(sam_spec["url"], sam_checkpoint):
             print("Could not download SAM checkpoint. Aborting.")
             return
     
     # Initialize processor
-    processor = SAMZODProcessor(dataset_root, sam_checkpoint)
+    processor = SAMZODProcessor(
+        dataset_root,
+        sam_checkpoint,
+        sam_model_type=sam_model_type,
+    )
     
     # Process dataset
     processor.process_dataset(num_frames=num_frames, output_dir=output_dir)

@@ -40,6 +40,30 @@ def get_all_frame_ids(zod_frames: ZodFrames) -> List[str]:
     print(f"Found {len(all_frame_ids)} total frames ({len(train_frame_ids)} train + {len(val_frame_ids)} val)")
     return all_frame_ids
 
+def _get_camera_image_with_fallback(zod_frame) -> Image.Image:
+    attempts = [Anonymization.DNAT, Anonymization.BLUR]
+    errors = []
+
+    for anonymization in attempts:
+        try:
+            return zod_frame.get_image(anonymization)
+        except FileNotFoundError as exc:
+            errors.append(f"{anonymization.name}: {exc}")
+        except Exception as exc:  # noqa: BLE001 - collect all issues for diagnostics
+            errors.append(f"{anonymization.name}: {exc}")
+
+    try:
+        return zod_frame.get_image()
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"DEFAULT: {exc}")
+
+    frame_identifier = getattr(zod_frame.info, "identifier", "unknown")
+    error_msg = "; ".join(errors) if errors else "no attempts made"
+    raise FileNotFoundError(
+        f"Unable to load camera image for frame {frame_identifier}. Attempts: {error_msg}"
+    )
+
+
 def process_frame_with_camera_lidar_fusion(zod_frames: ZodFrames, frame_id: str) -> Image.Image:
     """
     Process a single frame and return camera image with LiDAR point cloud overlay.
@@ -54,8 +78,8 @@ def process_frame_with_camera_lidar_fusion(zod_frames: ZodFrames, frame_id: str)
     # Get the frame object
     zod_frame = zod_frames[frame_id]
     
-    # Get camera image with DNAT anonymization
-    image = zod_frame.get_image(Anonymization.DNAT)
+    # Get camera image with anonymization fallback
+    image = _get_camera_image_with_fallback(zod_frame)
 
     # Get image timestamp for LiDAR aggregation
     image_timestamp = zod_frame.info.keyframe_time.timestamp()

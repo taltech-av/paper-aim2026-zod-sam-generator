@@ -4,3 +4,5 @@ output_clft
 venv
 .ipynb_checkpoints
 *.pth
+__pycache__
+output_clft_full
