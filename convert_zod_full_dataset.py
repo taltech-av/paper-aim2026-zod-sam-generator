@@ -603,6 +603,9 @@ class CLFTFullDatasetConverter:
 
             # Object annotation enrichment --------------------------------------
             class_counts: Counter[str] = Counter()
+            occlusion_counts: Counter[str] = Counter()
+            objects_details = []
+            
             try:
                 annotations = self.zod_frames[frame_id].get_annotation(AnnotationProject.OBJECT_DETECTION)
             except Exception:
@@ -611,6 +614,29 @@ class CLFTFullDatasetConverter:
             for annotation in annotations:
                 name = getattr(annotation, "name", None) or "unknown"
                 class_counts[name] += 1
+                
+                # Extract occlusion information - try different methods
+                occlusion = None
+                if hasattr(annotation, 'occlusion'):
+                    occlusion = annotation.occlusion
+                elif hasattr(annotation, 'visibility'):
+                    occlusion = annotation.visibility
+                elif hasattr(annotation, 'occlusion_level'):
+                    occlusion = annotation.occlusion_level
+                
+                if occlusion is not None:
+                    occlusion_str = str(occlusion).replace("Occlusion.", "").replace("Visibility.", "").lower()
+                    occlusion_counts[occlusion_str] += 1
+                else:
+                    occlusion_counts['unknown'] += 1
+                
+                # Extract detailed object information
+                object_info = {
+                    "name": name,
+                    "occlusion": occlusion_str if occlusion is not None else "unknown",
+                }
+                
+                objects_details.append(object_info)
 
             metadata["object_class_counts"] = dict(sorted(class_counts.items()))
             metadata["object_classes_present"] = sorted(class_counts.keys())
@@ -618,12 +644,76 @@ class CLFTFullDatasetConverter:
             if class_counts:
                 metadata["dominant_object_class"] = max(class_counts.items(), key=lambda item: item[1])[0]
 
-            metadata["has_pedestrians"] = bool(metadata.get("num_pedestrians", 0))
-            metadata["has_vulnerable_road_users"] = bool(metadata.get("num_vulnerable_vehicles", 0) or metadata.get("num_pedestrians", 0))
-            metadata["has_traffic_control"] = bool(metadata.get("num_traffic_signs", 0) or metadata.get("num_traffic_lights", 0))
+            # Detailed object information
+            metadata["objects"] = objects_details
+            metadata["num_objects_detailed"] = len(objects_details)
 
-            target_path.write_text(json.dumps(metadata, indent=2))
-            return True
+            # Occlusion enrichment ---------------------------------------------
+            # Define all possible occlusion levels
+            all_occlusion_levels = {"none", "light", "medium", "heavy", "veryheavy", "unknown"}
+            
+            # Initialize counts for all levels
+            full_occlusion_counts = {level: 0 for level in all_occlusion_levels}
+            full_occlusion_counts.update(occlusion_counts)  # Update with actual counts
+            
+        metadata["occlusion_counts"] = dict(sorted(full_occlusion_counts.items()))
+        metadata["occlusion_levels_present"] = sorted([level for level, count in full_occlusion_counts.items() if count > 0])
+        
+        # Calculate occlusion percentages
+        total_objects = metadata["num_objects_total"]
+        if total_objects > 0:
+            occlusion_percentages = {level: (count / total_objects) * 100 for level, count in full_occlusion_counts.items()}
+            metadata["occlusion_percentages"] = dict(sorted(occlusion_percentages.items()))
+        else:
+            metadata["occlusion_percentages"] = {level: 0.0 for level in all_occlusion_levels}
+        
+        # Check for every occlusion level
+        metadata["has_none_occlusion"] = full_occlusion_counts.get("none", 0) > 0
+        metadata["has_light_occlusion"] = full_occlusion_counts.get("light", 0) > 0
+        metadata["has_medium_occlusion"] = full_occlusion_counts.get("medium", 0) > 0
+        metadata["has_heavy_occlusion"] = full_occlusion_counts.get("heavy", 0) > 0
+        metadata["has_veryheavy_occlusion"] = full_occlusion_counts.get("veryheavy", 0) > 0
+        metadata["has_unknown_occlusion"] = full_occlusion_counts.get("unknown", 0) > 0
+        
+        # Count objects for each occlusion level
+        metadata["num_objects_none_occlusion"] = full_occlusion_counts.get("none", 0)
+        metadata["num_objects_light_occlusion"] = full_occlusion_counts.get("light", 0)
+        metadata["num_objects_medium_occlusion"] = full_occlusion_counts.get("medium", 0)
+        metadata["num_objects_heavy_occlusion"] = full_occlusion_counts.get("heavy", 0)
+        metadata["num_objects_veryheavy_occlusion"] = full_occlusion_counts.get("veryheavy", 0)
+        metadata["num_objects_unknown_occlusion"] = full_occlusion_counts.get("unknown", 0)
+        
+        # Occlusion summary statistics
+        total_objects_with_occlusion = sum(full_occlusion_counts.values())
+        if total_objects_with_occlusion > 0:
+            metadata["occlusion_summary"] = {
+                "total_objects_with_occlusion": total_objects_with_occlusion,
+                "none_occlusion_percentage": (full_occlusion_counts.get("none", 0) / total_objects_with_occlusion) * 100,
+                "light_occlusion_percentage": (full_occlusion_counts.get("light", 0) / total_objects_with_occlusion) * 100,
+                "medium_occlusion_percentage": (full_occlusion_counts.get("medium", 0) / total_objects_with_occlusion) * 100,
+                "heavy_occlusion_percentage": (full_occlusion_counts.get("heavy", 0) / total_objects_with_occlusion) * 100,
+                "veryheavy_occlusion_percentage": (full_occlusion_counts.get("veryheavy", 0) / total_objects_with_occlusion) * 100,
+                "unknown_occlusion_percentage": (full_occlusion_counts.get("unknown", 0) / total_objects_with_occlusion) * 100,
+                "most_common_occlusion": max(full_occlusion_counts.items(), key=lambda x: x[1])[0] if any(full_occlusion_counts.values()) else None
+            }
+        else:
+            metadata["occlusion_summary"] = {
+                "total_objects_with_occlusion": 0,
+                "none_occlusion_percentage": 0.0,
+                "light_occlusion_percentage": 0.0,
+                "medium_occlusion_percentage": 0.0,
+                "heavy_occlusion_percentage": 0.0,
+                "veryheavy_occlusion_percentage": 0.0,
+                "unknown_occlusion_percentage": 0.0,
+                "most_common_occlusion": None
+            }
+
+        metadata["num_pedestrians"] = metadata.get("num_pedestrians", 0)
+        metadata["num_vulnerable_road_users"] = metadata.get("num_vulnerable_vehicles", 0) + metadata.get("num_pedestrians", 0)
+        metadata["num_traffic_control"] = metadata.get("num_traffic_signs", 0) + metadata.get("num_traffic_lights", 0)
+
+        target_path.write_text(json.dumps(metadata, indent=2))
+        return True
         return False
 
     # ------------------------------------------------------------------

@@ -6,3 +6,4 @@ venv
 *.pth
 __pycache__
 output_clft_full
+zod_dataset

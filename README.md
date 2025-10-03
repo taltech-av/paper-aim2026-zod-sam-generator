@@ -162,3 +162,16 @@ python convert_zod_full_dataset.py \
 ```
 Requires matching `camera/frame_<id>.png` and `annotation/frame_<id>.png` files in the output directory. Overlays are written to `visualizations/frame_<id>_sam_overlay.png` without rerunning SAM.
 
+Metadata:
+```bash
+source venv/bin/activate
+python convert_zod_full_dataset.py \
+  --dataset-root /media/tom/ml/zod-data \
+  --version full \
+  --output-root /media/tom/ml/projects/clft-zod/output_clft_full \
+  --components metadata \
+  --workers 18 \
+  --batch-size 256 \
+  --progress-log /media/tom/ml/projects/clft-zod/output_clft_full/progress_metadata.log \
+  --no-skip-existing
+```
