@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
 """
-Generate metadata for each segmentation frame with:
-- Pixel counts per class
-- Weather condition (rain/fair) from scraped_weather
-- Time of day (day/night) from time_of_day
-- Split into 4 categories: day_rain, day_fair, night_rain, night_fair
 """
 
 import json
@@ -20,14 +15,14 @@ ANNOTATION_DIR = OUTPUT_DIR / "annotation"
 METADATA_DIR = OUTPUT_DIR / "metadata"
 DATASET_ROOT = Path("/media/tom/ml/zod-data")
 
-# Class names
+# Class names (updated for merged SAM + LiDAR annotations)
 CLASS_NAMES = {
     0: "background",
-    1: "lane",
-    2: "vehicle",
-    3: "sign",
-    4: "cyclist",
-    5: "pedestrian"
+    1: "vehicle",
+    2: "sign",
+    3: "cyclist",
+    4: "pedestrian",
+    5: "ignore"  # LiDAR-only regions
 }
 
 print("🔧 Generating metadata for segmentation frames...")
@@ -178,11 +173,59 @@ split_summary = {
     }
 }
 
-summary_file = METADATA_DIR / "split_summary.json"
+summary_file = OUTPUT_DIR / "split_summary.json"
 with open(summary_file, 'w') as f:
     json.dump(split_summary, f, indent=2)
 
 print(f"\n💾 Split summary saved to: {summary_file}")
+
+# Calculate segmentation statistics (total pixels per class across dataset)
+print(f"\n📊 Calculating segmentation statistics...")
+class_totals = defaultdict(int)
+total_pixels_all_frames = 0
+
+for metadata_file in METADATA_DIR.glob("frame_*.json"):
+    if metadata_file.name == "split_summary.json":
+        continue
+    
+    with open(metadata_file, 'r') as f:
+        metadata = json.load(f)
+        pixel_counts = metadata.get("pixel_counts", {})
+        
+        for class_id, count in pixel_counts.items():
+            class_totals[int(class_id)] += count
+            total_pixels_all_frames += count
+
+# Print segmentation statistics
+print(f"\n📈 Segmentation Statistics (Total Pixels per Class):")
+print(f"{'Class':<12} {'Name':<12} {'Pixels':>15} {'Percentage':>12}")
+print("-" * 55)
+for class_id in sorted(class_totals.keys()):
+    class_name = CLASS_NAMES.get(class_id, f"class_{class_id}")
+    pixels = class_totals[class_id]
+    percentage = (pixels / total_pixels_all_frames * 100) if total_pixels_all_frames > 0 else 0
+    print(f"{class_id:<12} {class_name:<12} {pixels:>15,} {percentage:>11.1f}%")
+print("-" * 55)
+print(f"{'TOTAL':<12} {'':<12} {total_pixels_all_frames:>15,} {100.0:>11.1f}%")
+
+# Save segmentation statistics
+segmentation_stats = {
+    "total_pixels": total_pixels_all_frames,
+    "classes": {
+        class_id: {
+            "name": CLASS_NAMES.get(class_id, f"class_{class_id}"),
+            "pixels": class_totals[class_id],
+            "percentage": float(class_totals[class_id] / total_pixels_all_frames * 100) if total_pixels_all_frames > 0 else 0
+        }
+        for class_id in sorted(class_totals.keys())
+    }
+}
+
+stats_file = OUTPUT_DIR / "segmentation_statistics.json"
+with open(stats_file, 'w') as f:
+    json.dump(segmentation_stats, f, indent=2)
+
+print(f"\n💾 Segmentation statistics saved to: {stats_file}")
 
 # Generate split files (lists of frame IDs per split)
 print(f"\n📝 Generating dataset split files...")
@@ -233,16 +276,18 @@ for frame_id in tqdm(all_frames, desc="Scoring frames"):
         stats = metadata.get("statistics", {})
         
         # Count pixels for important classes (prioritize rare objects)
-        pedestrian_px = pixel_counts.get("5", 0)  # Pedestrian
-        cyclist_px = pixel_counts.get("4", 0)     # Cyclist
-        sign_px = pixel_counts.get("3", 0)        # Sign
-        vehicle_px = pixel_counts.get("2", 0)     # Vehicle
+        pedestrian_px = pixel_counts.get(4, 0)  # Pedestrian (class 4)
+        cyclist_px = pixel_counts.get(3, 0)     # Cyclist (class 3)
+        sign_px = pixel_counts.get(2, 0)        # Sign (class 2)
+        vehicle_px = pixel_counts.get(1, 0)     # Vehicle (class 1)
+        ignore_px = pixel_counts.get(5, 0)      # Ignore (class 5) - LiDAR only
         
         num_classes = stats.get("num_classes", 0)
         fg_percentage = stats.get("foreground_percentage", 0)
         
         # Score: prioritize rare objects (pedestrians, cyclists, signs)
         # Weight: Pedestrian=5x, Cyclist=4x, Sign=3x, Vehicle=1x
+        # Ignore class gets minimal weight since it's LiDAR-only regions
         score = (
             (pedestrian_px > 0) * 5000 +  # Has pedestrian (bonus)
             (cyclist_px > 0) * 4000 +      # Has cyclist (bonus)
@@ -251,6 +296,7 @@ for frame_id in tqdm(all_frames, desc="Scoring frames"):
             cyclist_px * 0.08 +            # Cyclist pixel count
             sign_px * 0.05 +               # Sign pixel count
             vehicle_px * 0.01 +            # Vehicle pixel count (common, lower weight)
+            ignore_px * 0.005 +            # Ignore regions (minimal weight)
             num_classes * 1000 +           # Diversity bonus
             fg_percentage * 10             # Foreground coverage
         )
