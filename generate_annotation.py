@@ -24,17 +24,21 @@ import cv2
 from tqdm import tqdm
 import argparse
 
+from zod import ZodFrames
+
 
 class AnnotationMerger:
-    def __init__(self, output_root, frames_list):
+    def __init__(self, output_root, frames_list, zod_root):
         """Initialize annotation merger
         
         Args:
             output_root: Path to output_clft_v2 directory
             frames_list: Path to frames_to_process.txt
+            zod_root: Path to ZOD dataset root
         """
         self.output_root = Path(output_root)
         self.frames_list = Path(frames_list)
+        self.zod_root = Path(zod_root)
         
         # Input directories
         self.camera_dir = self.output_root / "camera"
@@ -48,16 +52,12 @@ class AnnotationMerger:
         # Class mapping
         self.CLASSES = {
             0: 'background',
-            1: 'vehicle',
-            2: 'sign',
-            3: 'cyclist',
-            4: 'pedestrian',
-            5: 'ignore',  # LiDAR-only regions
+            1: 'ignore',  # LiDAR-only regions
+            2: 'vehicle',  # From SAM
+            3: 'sign',     # From SAM
+            4: 'cyclist',  # From SAM
+            5: 'pedestrian', # From SAM
         }
-        
-        # Load frames to process
-        with open(self.frames_list) as f:
-            self.frame_ids = [line.strip() for line in f if line.strip()]
         
         # Load already processed frames to skip them
         self.processed_frames_file = self.output_root / "processed_merged_frames.txt"
@@ -65,6 +65,17 @@ class AnnotationMerger:
         if self.processed_frames_file.exists():
             with open(self.processed_frames_file) as f:
                 self.processed_frames = set(line.strip() for line in f if line.strip())
+        
+        # Load frames to process
+        try:
+            with open(self.frames_list) as f:
+                self.frame_ids = [line.strip() for line in f if line.strip()]
+            print(f"✓ Loaded {len(self.frame_ids):,} frames from {self.frames_list}")
+        except FileNotFoundError:
+            print("Initializing ZOD dataset to get all frames...")
+            zod_frames = ZodFrames(dataset_root=self.zod_root, version="full")
+            self.frame_ids = sorted(zod_frames.get_all_ids())
+            print(f"✓ Frames file not found, processing all {len(self.frame_ids):,} frames from ZOD dataset")
         
         # Filter out already processed frames
         original_count = len(self.frame_ids)
@@ -99,13 +110,17 @@ class AnnotationMerger:
         if not pkl_path.exists():
             return None if not return_distances else (None, None)
         
+        # Check if file is empty (corrupted/incomplete)
+        if pkl_path.stat().st_size == 0:
+            return None if not return_distances else (None, None)
+        
         try:
             with open(pkl_path, 'rb') as f:
                 clft_data = pickle.load(f)
             
-            # Extract camera coordinates and filter for front camera (ID=0)
+            # Extract camera coordinates and filter for front camera (ID=1)
             camera_coords = clft_data['camera_coordinates']
-            front_mask = camera_coords[:, 0] == 0
+            front_mask = camera_coords[:, 0] == 1
             
             if not np.any(front_mask):
                 return None if not return_distances else (None, None)
@@ -209,11 +224,23 @@ class AnnotationMerger:
     def merge_annotations(self, frame_id):
         """Merge SAM annotation with LiDAR data
         
+        SAM Input Classes (kept as-is for consistency):
+          2: Vehicle
+          3: Sign  
+          4: Cyclist
+          5: Pedestrian
+        
+        Merged Output Classes:
+          0: Background
+          1: Ignore (LiDAR-only regions)
+          2: Vehicle (from SAM)
+          3: Sign (from SAM)
+          4: Cyclist (from SAM)
+          5: Pedestrian (from SAM)
+        
         Logic:
-        1. Start with SAM camera annotation (classes 1-4)
-        2. Create LiDAR mask with scaled coordinates
-        3. Where LiDAR exists but annotation is background (0), set to ignore (5)
-        4. Keep all other SAM annotations unchanged
+        1. Keep SAM classes unchanged (no remapping)
+        2. Add ignore class (1) where LiDAR exists but annotation is background
         """
         try:
             # Load SAM annotation
@@ -221,11 +248,11 @@ class AnnotationMerger:
             if sam_annotation is None:
                 return None
             
+            # Start with SAM annotation (keep classes as-is)
+            merged_annotation = sam_annotation.copy()
+            
             # Load LiDAR points with scaling to match annotation size
             lidar_points = self.load_lidar_pkl(frame_id, target_shape=sam_annotation.shape)
-            
-            # Start with SAM annotation
-            merged_annotation = sam_annotation.copy()
             
             # If we have LiDAR data, add ignore class
             if lidar_points is not None:
@@ -236,9 +263,9 @@ class AnnotationMerger:
                     radius=3  # 3-pixel radius around each LiDAR point
                 )
                 
-                # Where LiDAR exists (1) AND annotation is background (0), set to ignore (5)
+                # Where LiDAR exists (1) AND annotation is background (0), set to ignore (1)
                 ignore_regions = (lidar_mask == 1) & (sam_annotation == 0)
-                merged_annotation[ignore_regions] = 5
+                merged_annotation[ignore_regions] = 1
             
             return merged_annotation
             
@@ -272,11 +299,11 @@ class AnnotationMerger:
             # Color map for visualization
             color_map = {
                 0: np.array([0, 0, 0], dtype=np.uint8),          # Background - Black
-                1: np.array([255, 0, 0], dtype=np.uint8),        # Vehicle - Red
-                2: np.array([255, 255, 0], dtype=np.uint8),      # Sign - Yellow
-                3: np.array([255, 0, 255], dtype=np.uint8),      # Cyclist - Magenta
-                4: np.array([0, 255, 0], dtype=np.uint8),        # Pedestrian - Green
-                5: np.array([128, 128, 128], dtype=np.uint8),    # Ignore - Gray
+                1: np.array([128, 128, 128], dtype=np.uint8),    # Ignore - Gray
+                2: np.array([255, 0, 0], dtype=np.uint8),        # Vehicle - Red
+                3: np.array([255, 255, 0], dtype=np.uint8),      # Sign - Yellow
+                4: np.array([255, 0, 255], dtype=np.uint8),      # Cyclist - Magenta
+                5: np.array([0, 255, 0], dtype=np.uint8),        # Pedestrian - Green
             }
         
         for idx, frame_id in enumerate(tqdm(self.frame_ids, desc="Merging annotations")):
@@ -442,15 +469,21 @@ def main():
         epilog="""
 Class mapping:
   0: Background
-  1: Vehicle (camera annotation)
-  2: Sign (camera annotation)
-  3: Cyclist (camera annotation)
-  4: Pedestrian (camera annotation)
-  5: Ignore (LiDAR exists, no camera annotation)
+  1: Ignore (LiDAR-only regions)
+  2: Vehicle (from SAM)
+  3: Sign (from SAM)
+  4: Cyclist (from SAM)
+  5: Pedestrian (from SAM)
+
+SAM Input Classes (kept as-is):
+  2: Vehicle
+  3: Sign
+  4: Cyclist  
+  5: Pedestrian
 
 Logic:
-  - Keep all SAM camera annotations (classes 1-4)
-  - Add "Ignore" class (5) where LiDAR points exist but no camera annotation
+  - Keep SAM camera annotations unchanged
+  - Add "Ignore" class (1) where LiDAR points exist but no camera annotation
   - Background (0) remains where neither camera nor LiDAR detects anything
         """
     )
@@ -462,6 +495,7 @@ Logic:
     # Configuration
     OUTPUT_ROOT = Path("/media/tom/ml/projects/clft-zod/output_clft_v2")
     FRAMES_LIST = Path("/media/tom/ml/projects/clft-zod/frames_to_process.txt")
+    ZOD_ROOT = Path("/media/tom/ml/zod-data")
     
     print("="*60)
     print("SAM + LiDAR Annotation Merger")
@@ -469,7 +503,8 @@ Logic:
     
     merger = AnnotationMerger(
         output_root=OUTPUT_ROOT,
-        frames_list=FRAMES_LIST
+        frames_list=FRAMES_LIST,
+        zod_root=ZOD_ROOT
     )
     
     # Process all frames with optional visualization

@@ -114,11 +114,11 @@ class ZODProcessor:
         
         # Class-specific minimum size thresholds
         self.min_size_by_class = {
-            1: 20,  # Lane
+            1: 10,  # Lane
             2: 30,  # Vehicle
-            3: 15,  # Sign - SMALL signs are important
-            4: 15,  # Cyclist - SMALL for distant cyclists
-            5: 15,  # Pedestrian - SMALL for distant people
+            3: 15,  # Sign
+            4: 15,  # Cyclist
+            5: 15,  # Pedestrian
         }
         
         # Colors for visualization (BGR format for OpenCV) - Very distinct colors
@@ -623,7 +623,7 @@ def main():
                        help='Path to ZOD dataset root')
     parser.add_argument('--output-root', type=str, default='./output_clft_v2',
                        help='Output directory')
-    parser.add_argument('--frame-list', type=str, required=True, default='frames_to_process.txt',
+    parser.add_argument('--frame-list', type=str, default='frames_to_process.txt',
                        help='Path to frames_to_process.txt')
     parser.add_argument('--sam-model', type=str, choices=['vit_b', 'vit_l', 'vit_h'],
                        default='vit_h', help='SAM model type')

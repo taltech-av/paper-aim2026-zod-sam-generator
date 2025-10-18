@@ -12,6 +12,7 @@ import numpy as np
 import pickle
 from pathlib import Path
 from tqdm import tqdm
+import os
 
 from zod import ZodFrames
 from zod.constants import Camera, Lidar
@@ -41,7 +42,7 @@ class LiDARDataGenerator:
         # Camera mapping for CLFT format (camera_name -> camera_id)
         # ZOD only provides Camera.FRONT
         self.camera_mapping = {
-            Camera.FRONT: 0,
+            Camera.FRONT: 1,
         }
         
         print("Initializing ZOD dataset...")
@@ -49,9 +50,25 @@ class LiDARDataGenerator:
         print(f"✓ ZOD initialized")
         
         # Load frames to process
-        with open(self.frames_list) as f:
-            self.frame_ids = [line.strip() for line in f if line.strip()]
-        print(f"✓ Loaded {len(self.frame_ids):,} frames to process")
+        try:
+            with open(self.frames_list) as f:
+                self.frame_ids = [line.strip() for line in f if line.strip()]
+            print(f"✓ Loaded {len(self.frame_ids):,} frames from {self.frames_list}")
+        except FileNotFoundError:
+            # Check for environment variable override
+            env_frames = os.environ.get("FRAMES_LIST")
+            if env_frames:
+                try:
+                    env_frames_path = Path(env_frames)
+                    with open(env_frames_path) as f:
+                        self.frame_ids = [line.strip() for line in f if line.strip()]
+                    print(f"✓ Loaded {len(self.frame_ids):,} frames from environment override: {env_frames_path}")
+                except Exception as e:
+                    print(f"❌ Error loading frames from environment: {e}")
+                    self.frame_ids = []
+            else:
+                self.frame_ids = sorted(self.zod_frames.get_all_ids())
+                print(f"✓ Frames file not found, processing all {len(self.frame_ids):,} frames from ZOD dataset")
     
     def project_lidar_to_camera(self, points_3d, calibration, camera_enum):
         """Project LiDAR points to camera using ZOD's projection method"""
