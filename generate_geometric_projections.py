@@ -167,18 +167,29 @@ def main():
     parser = argparse.ArgumentParser(description="Create geometric LiDAR projections")
     parser.add_argument("--input_dir", default="output_clft_v2", help="Input directory")
     parser.add_argument("--output_dir", default="output_clft_v2/lidar_geometric", help="Output directory")
-    parser.add_argument("--frames_file", default="output_clft_v2/splits/test.txt", help="Frames to process")
+    parser.add_argument("--frames_file", help="Frames file to process (optional - if not provided, processes all frames from metadata)")
     parser.add_argument("--verify", action="store_true", help="Verify geometric content")
 
     args = parser.parse_args()
 
-    # Load frame list
-    frame_ids = []
-    with open(args.frames_file) as f:
-        for line in f:
-            if line.strip():
-                frame_id = line.strip().split('/')[-1].replace('frame_', '').replace('.png', '')
+    # Get frame IDs
+    if args.frames_file:
+        # Load from specified file
+        frame_ids = []
+        with open(args.frames_file) as f:
+            for line in f:
+                if line.strip():
+                    frame_id = line.strip().split('/')[-1].replace('frame_', '').replace('.png', '')
+                    frame_ids.append(frame_id)
+    else:
+        # Get all frame IDs from lidar pickle files
+        lidar_dir = Path(args.input_dir) / "lidar"
+        frame_ids = []
+        if lidar_dir.exists():
+            for pkl_file in lidar_dir.glob("frame_*.pkl"):
+                frame_id = pkl_file.stem.replace('frame_', '')
                 frame_ids.append(frame_id)
+        frame_ids.sort()  # Ensure consistent ordering
 
     print(f"📊 Processing {len(frame_ids)} frames")
 
