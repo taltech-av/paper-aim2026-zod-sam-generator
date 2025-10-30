@@ -71,7 +71,7 @@ class ZODProcessor:
         
         # Create output directories
         self.output_dirs = {
-            'annotation': self.output_root / 'annotation',
+            'annotation': self.output_root / 'annotation_sam',
             'camera': self.output_root / 'camera',
             'overlay': self.output_root / 'visualizations' / 'overlay',
             'boxes': self.output_root / 'visualizations' / 'boxes',
@@ -621,7 +621,7 @@ def main():
     
     parser.add_argument('--dataset-root', type=str, default='/media/tom/ml/zod-data',
                        help='Path to ZOD dataset root')
-    parser.add_argument('--output-root', type=str, default='./output_clft_v2',
+    parser.add_argument('--output-root', type=str, default='./output',
                        help='Output directory')
     parser.add_argument('--frame-list', type=str, default='frames_to_process.txt',
                        help='Path to frames_to_process.txt')
