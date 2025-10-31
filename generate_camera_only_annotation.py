@@ -76,73 +76,84 @@ class CameraOnlyAnnotationGenerator:
     def create_ignore_regions(self, sam_annotation, camera_img=None):
         """Create ignore regions (class 1) for camera-only training
 
-        Strategies for ignore regions:
-        1. Peripheral regions (outside central field of view)
-        2. Areas with poor contrast/low visibility
-        3. Areas with motion blur (if detectable)
-        4. Over/under exposed regions
+        Dynamic strategy based on object positions:
+        1. Find topmost and bottommost objects in scene
+        2. Mark areas BEYOND objects (with margin) as ignore
+        3. If no objects near edges, minimal ignore region
+        4. If objects at edges, larger ignore region to exclude them
+        5. Mark very small objects as ignore (noise)
+        
+        Purpose of classes:
+        - Background (0): Empty areas, safe negative samples for training
+        - Ignore (1): Don't compute loss here - uncertain/distorted areas
         """
         ignore_mask = np.zeros_like(sam_annotation, dtype=bool)
 
         h, w = sam_annotation.shape
 
-        # Strategy 1: Peripheral regions (outside central 80% of image)
-        # Create elliptical mask for central region
-        center_y, center_x = h // 2, w // 2
-        # Use 80% of dimensions for central region
-        axis_y = int(h * 0.8) // 2
-        axis_x = int(w * 0.8) // 2
+        # Strategy 1: Dynamic edge strips based on object positions
+        # Find topmost and bottommost pixels with any object
+        has_any_object = np.isin(sam_annotation, [2, 3, 4, 5])  # Any object class
+        
+        if np.any(has_any_object):
+            # Find rows containing objects
+            rows_with_objects = np.any(has_any_object, axis=1)
+            object_rows = np.where(rows_with_objects)[0]
+            
+            if len(object_rows) > 0:
+                topmost_object = object_rows[0]
+                bottommost_object = object_rows[-1]
+                
+                # Add margin beyond objects (2% of height as safety margin)
+                margin = max(int(h * 0.02), 10)  # At least 10 pixels
+                
+                # Mark regions BEYOND objects as ignore
+                top_ignore_line = max(0, topmost_object - margin)
+                bottom_ignore_line = min(h, bottommost_object + margin)
+                
+                peripheral_mask = np.zeros_like(sam_annotation, dtype=bool)
+                peripheral_mask[:top_ignore_line, :] = True  # Above topmost object
+                peripheral_mask[bottom_ignore_line:, :] = True  # Below bottommost object
+            else:
+                # Fallback: minimal edges if detection fails
+                peripheral_mask = np.zeros_like(sam_annotation, dtype=bool)
+                peripheral_mask[:10, :] = True
+                peripheral_mask[-10:, :] = True
+        else:
+            # No objects in frame - mark larger edge strips as ignore (can't learn from this)
+            edge_fraction = 0.1
+            edge_height = int(h * edge_fraction)
+            peripheral_mask = np.zeros_like(sam_annotation, dtype=bool)
+            peripheral_mask[:edge_height, :] = True
+            peripheral_mask[-edge_height:, :] = True
 
-        y_coords, x_coords = np.ogrid[:h, :w]
-        # Elliptical distance from center
-        dist_from_center = ((x_coords - center_x) / axis_x) ** 2 + ((y_coords - center_y) / axis_y) ** 2
-        peripheral_mask = dist_from_center > 1.0
-        ignore_mask |= peripheral_mask
-
-        # Strategy 2: Areas with poor contrast (low local variance)
-        if camera_img is not None:
-            # Convert to grayscale for analysis
-            gray = cv2.cvtColor(camera_img, cv2.COLOR_BGR2GRAY).astype(float)
-
-            # Use simpler contrast detection - blur and compare
-            blurred = cv2.GaussianBlur(gray, (15, 15), 0)
-
-            # Calculate local contrast as difference from blurred version
-            local_contrast = np.abs(gray - blurred)
-
-            # Areas with very low local contrast (< 3) are likely poor visibility
-            low_contrast = local_contrast < 3
-            ignore_mask |= low_contrast
-
-            # Strategy 3: Over/under exposed regions
-            # Convert to HSV for brightness analysis
-            hsv = cv2.cvtColor(camera_img, cv2.COLOR_BGR2HSV)
-            brightness = hsv[:, :, 2].astype(float)
-
-            # Over-exposed (too bright, > 240)
-            over_exposed = brightness > 240
-            ignore_mask |= over_exposed
-
-            # Under-exposed (too dark, < 15)
-            under_exposed = brightness < 15
-            ignore_mask |= under_exposed
-
-        # Strategy 4: Very small isolated regions in SAM annotations
-        # (similar to noise reduction in other generators)
+        # Strategy 2: Mark ENTIRE objects that touch edge strips OR are very small
+        objects_to_ignore_mask = np.zeros_like(sam_annotation, dtype=bool)
+        
         for class_id in [2, 3, 4, 5]:  # object classes
             obj_mask = (sam_annotation == class_id)
             if np.any(obj_mask):
-                # Use OpenCV connected components instead of scipy
-                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(obj_mask.astype(np.uint8), connectivity=8)
+                # Find connected components
+                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                    obj_mask.astype(np.uint8), connectivity=8)
 
-                # Skip background (label 0)
+                # Check each object
                 for label_id in range(1, num_labels):
+                    object_region = (labels == label_id)
                     area = stats[label_id, cv2.CC_STAT_AREA]
+                    
+                    # Check if this object touches edge strips
+                    touches_edge = np.any(object_region & peripheral_mask)
+                    
+                    # Check if object is very small (< 50 pixels, likely noise)
+                    is_too_small = area < 50
+                    
+                    # Mark entire object for ignore if it touches edges or is too small
+                    if touches_edge or is_too_small:
+                        objects_to_ignore_mask |= object_region
 
-                    # Mark very small objects (< 20 pixels) as ignore
-                    if area < 20:
-                        region_mask = (labels == label_id)
-                        ignore_mask |= region_mask
+        # Combine: edge strips (background only) + entire objects that touch edges/too small
+        ignore_mask = peripheral_mask | objects_to_ignore_mask
 
         return ignore_mask
 
@@ -165,9 +176,10 @@ class CameraOnlyAnnotationGenerator:
             ignore_mask = self.create_ignore_regions(sam_annotation, camera_img)
 
             # Apply ignore regions (class 1)
-            # Only override background/unknown regions, don't overwrite existing objects
-            background_mask = (annotation == 0) & ignore_mask
-            annotation[background_mask] = 1
+            # IMPORTANT: Only apply ignore to background regions (class 0)
+            # Do NOT override object classes (2, 3, 4, 5) with ignore
+            can_be_ignored = (annotation == 0)
+            annotation[ignore_mask & can_be_ignored] = 1
 
             return annotation
 
@@ -250,10 +262,20 @@ class CameraOnlyAnnotationGenerator:
             print(f"📊 Visualizations created: {vis_count:,}")
         print(f"\n📁 Output: {self.camera_annotation_dir}/")
         print(f"\n🎯 Camera-Only Training Annotations:")
-        print(f"   📥 Input: SAM annotations + camera quality analysis")
+        print(f"   📥 Input: SAM annotations")
         print(f"   🎨 Classes: Background(0), Ignore(1), Vehicle(2), Sign(3), Cyclist(4), Pedestrian(5)")
-        print(f"   🔧 Ignore regions: Peripheral areas, low contrast, over/under exposure, tiny objects")
-        print(f"   🎯 Purpose: Camera-only model training with quality-aware ignore regions")
+        print(f"   🔧 Dynamic Ignore Strategy:")
+        print(f"      - Adapts to object positions in each frame")
+        print(f"      - Marks areas BEYOND objects (±2% margin)")
+        print(f"      - Objects touching edges → included with margin")
+        print(f"      - No objects → larger edge ignore zones")
+        print(f"      - Very small objects (< 50 pixels) → ignore")
+        print(f"   ✓ Full horizontal width preserved")
+        print(f"   ✓ Minimal ignore regions per frame")
+        print(f"   📊 Class Purpose:")
+        print(f"      - Background (0): Empty areas, negative samples (LOSS APPLIED)")
+        print(f"      - Ignore (1): Uncertain areas, distortion zones (NO LOSS)")
+        print(f"   🎯 Purpose: Scene-adaptive annotations for optimal training")
 
 
 def main():
@@ -267,15 +289,24 @@ REQUIRES: Run generate_sam.py first!
 
 Strategy:
 1. Start with SAM annotations (camera-based object segmentation)
-2. Add ignore regions (class 1) for areas unsuitable for training:
-   - Peripheral regions (outside central 80% field of view)
-   - Low contrast areas (poor visibility)
-   - Over/under exposed regions
-   - Very small isolated objects (< 20 pixels)
+2. **DYNAMIC** ignore regions based on object positions:
+   - Find topmost and bottommost objects in each frame
+   - Mark areas BEYOND objects (with 2% margin) as ignore
+   - Adapts per frame: objects at edges → minimal ignore, no objects → larger ignore
+   - Entire objects touching dynamic edge zones are marked ignore
+   - Very small isolated objects (< 50 pixels, noise) marked ignore
+3. Preserve full horizontal width (no side borders)
+4. Maximize usable training area per frame
+
+**Why Background vs Ignore?**
+  Background (0): Definite negative samples - model learns "not an object"
+                  Loss is calculated and backpropagated
+  Ignore (1):     Uncertain/ambiguous areas - model skips these
+                  Loss is NOT calculated (masked out in training)
 
 Class mapping:
-  0: Background (trainable)
-  1: Ignore (not trained on)
+  0: Background (trainable negative samples)
+  1: Ignore (loss masked, not trained on)
   2: Vehicle
   3: Sign
   4: Cyclist

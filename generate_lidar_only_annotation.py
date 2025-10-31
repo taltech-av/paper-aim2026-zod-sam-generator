@@ -40,15 +40,15 @@ class LiDARPNGAnnotationGenerator:
         self.output_root = Path(output_root)
 
         # Input directories
-        self.lidar_png_dir = self.output_root / "lidar_png_enhanced"  # Use enhanced version
+        self.lidar_png_dir = self.output_root / "lidar_png"  # Use enhanced version
         self.sam_annotation_dir = self.output_root / "annotation_sam"
 
         # Output directory for LiDAR annotations
-        self.lidar_annotation_dir = self.output_root / "lidar_png_enhanced_annotation"
+        self.lidar_annotation_dir = self.output_root / "annotation_lidar_png"
         self.lidar_annotation_dir.mkdir(parents=True, exist_ok=True)
 
         # Progress tracking
-        self.processed_frames_file = self.output_root / "processed_lidar_png_enhanced_annotations.txt"
+        self.processed_frames_file = self.output_root / "processed_lidar_png_annotations.txt"
         self.processed_frames = set()
         if self.processed_frames_file.exists():
             with open(self.processed_frames_file) as f:
@@ -74,7 +74,7 @@ class LiDARPNGAnnotationGenerator:
         # Find intersection - frames with both inputs
         available_frame_ids = lidar_frame_ids & sam_frame_ids
         
-        print(f"✓ Found {len(lidar_frame_ids):,} enhanced lidar_png files")
+        print(f"✓ Found {len(lidar_frame_ids):,} lidar_png files")
         print(f"✓ Found {len(sam_frame_ids):,} SAM annotation files")
         print(f"✓ Found {len(available_frame_ids):,} frames with both inputs")
         
@@ -90,7 +90,7 @@ class LiDARPNGAnnotationGenerator:
         print(f"✓ Remaining to process: {len(self.frame_ids):,}")
 
         # LiDAR annotation parameters
-        self.density_threshold = 0.05  # 5% density threshold for sparse regions
+        self.density_threshold = 0.30  # 30% density threshold for sparse regions (was 5%, too low for enhanced data)
         self.distance_threshold = 60.0  # Points beyond 60m become ignore
         self.dilation_iterations = 3  # More dilation for enhanced lidar_png
 
@@ -114,10 +114,10 @@ class LiDARPNGAnnotationGenerator:
         return annotation
 
     def create_lidar_native_annotation(self, enhanced_lidar_img, sam_annotation):
-        """Create LiDAR-native annotation using enhanced lidar_png and SAM guidance
+        """Create LiDAR-native annotation using lidar_png and SAM guidance
 
         Strategy:
-        1. Use enhanced lidar_png for LiDAR coverage and geometric analysis
+        1. Use lidar_png for LiDAR coverage and geometric analysis
         2. Use SAM as ground truth for object locations and types
         3. Map SAM-identified objects onto actual LiDAR points
         4. Create LiDAR-native segmentation with proper class distinctions
@@ -155,7 +155,8 @@ class LiDARPNGAnnotationGenerator:
         # 1. Background class (0): Areas with no LiDAR coverage
         # (already initialized to 0)
 
-        # 2. Ignore class (1): Sparse LiDAR regions and distant points
+        # 2. Ignore class (1): Sparse LiDAR regions, distant points, AND edge regions
+        # Strategy A: Sparse/distant detection (quality-based ignore)
         # Create density map using gaussian filter for local coverage analysis
         lidar_density = ndimage.gaussian_filter(
             lidar_coverage.astype(float),
@@ -164,22 +165,53 @@ class LiDARPNGAnnotationGenerator:
             cval=0
         )
 
-        # Areas with sparse LiDAR coverage (< 5% local density)
-        sparse_regions = lidar_density < self.density_threshold
+        # Areas with sparse LiDAR coverage (< 30% local density)
+        # BUT only where we actually have some LiDAR points
+        sparse_regions = (lidar_density < self.density_threshold) & lidar_coverage
 
         # Areas beyond distance threshold (approximate)
         distant_regions = (distance_map > self.distance_threshold) & lidar_coverage
 
-        # Combine sparse and distant regions as ignore
-        ignore_regions = sparse_regions | distant_regions
+        # Strategy B: Dynamic vertical edge regions (consistency with camera)
+        # Find topmost and bottommost objects from SAM to define usable region
+        has_any_object = np.isin(sam_annotation, [2, 3, 4, 5])
+        vertical_edge_regions = np.zeros_like(sam_annotation, dtype=bool)
+        
+        if np.any(has_any_object):
+            rows_with_objects = np.any(has_any_object, axis=1)
+            object_rows = np.where(rows_with_objects)[0]
+            
+            if len(object_rows) > 0:
+                topmost_object = object_rows[0]
+                bottommost_object = object_rows[-1]
+                
+                # Add margin beyond objects (2% of height as safety margin)
+                margin = max(int(h * 0.02), 10)
+                
+                # Mark regions BEYOND objects as ignore
+                top_ignore_line = max(0, topmost_object - margin)
+                bottom_ignore_line = min(h, bottommost_object + margin)
+                
+                vertical_edge_regions[:top_ignore_line, :] = True  # Above objects
+                vertical_edge_regions[bottom_ignore_line:, :] = True  # Below objects
+        
+        # Combine all ignore criteria
+        ignore_regions = sparse_regions | distant_regions | vertical_edge_regions
         annotation[ignore_regions] = 1
 
         # 3. Objects from SAM guidance: Map onto LiDAR points
         # Only mark LiDAR points that fall within SAM object regions
         for sam_class_id in [2, 3, 4, 5]:  # vehicle, sign, cyclist, pedestrian
             sam_class_mask = (sam_annotation == sam_class_id)
+            # Only apply where we have LiDAR coverage AND it's not an ignore region
             lidar_in_class = sam_class_mask & lidar_coverage & ~ignore_regions
             annotation[lidar_in_class] = sam_class_id  # Preserve SAM class
+
+        # 4. Final cleanup: Ensure areas without LiDAR coverage are background
+        # But preserve ignore regions that have sparse LiDAR coverage
+        no_lidar = ~lidar_coverage
+        annotation[no_lidar] = 0  # Force background only where there's NO LiDAR at all
+        # Do NOT overwrite ignore regions that were set in step 2
 
         return annotation
 
@@ -203,6 +235,22 @@ class LiDARPNGAnnotationGenerator:
                 # Only expand into background/ignore regions (don't overwrite other objects)
                 valid_expansion = dilated_mask & ((annotation == 0) | (annotation == 1))
                 dilated[valid_expansion] = class_id
+
+        # Force edge rows to background to prevent dilation artifacts
+        # Dynamic edge clearing based on dilation radius
+        edge_rows = self.dilation_iterations * 2 + 1  # Kernel radius * 2 + 1 for safety
+        
+        # But check if we have objects near edges - if so, use minimal clearing
+        h = dilated.shape[0]
+        has_objects_top = np.any(np.isin(dilated[edge_rows:edge_rows*2, :], [2, 3, 4, 5]))
+        has_objects_bottom = np.any(np.isin(dilated[-edge_rows*2:-edge_rows, :], [2, 3, 4, 5]))
+        
+        # Clear fewer rows if objects are near edges (to preserve them)
+        top_clear = 2 if has_objects_top else edge_rows
+        bottom_clear = 2 if has_objects_bottom else edge_rows
+        
+        dilated[:top_clear, :] = 0  # Top rows
+        dilated[-bottom_clear:, :] = 0  # Bottom rows
 
         return dilated
 
@@ -292,19 +340,23 @@ class LiDARPNGAnnotationGenerator:
             # Create visualization if requested
             if create_vis:
                 try:
-                    # Create colored visualization of LiDAR object annotations only
+                    # Create colored visualization showing all classes
+                    # Background (0) = Black, Ignore (1) = Gray, Objects (2-5) = Colors
                     colored_annotation = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
                     
-                    # Only visualize object classes (2-5), background/ignore remain black
-                    object_color_map = {
-                        2: np.array([255, 0, 0], dtype=np.uint8),        # Vehicle - Red
-                        3: np.array([255, 255, 0], dtype=np.uint8),      # Sign - Yellow
-                        4: np.array([255, 0, 255], dtype=np.uint8),      # Cyclist - Magenta
-                        5: np.array([0, 255, 0], dtype=np.uint8),        # Pedestrian - Green
+                    # Color map for all classes (BGR format for OpenCV)
+                    full_color_map = {
+                        0: np.array([0, 0, 0], dtype=np.uint8),          # Background - Black
+                        1: np.array([128, 128, 128], dtype=np.uint8),    # Ignore - Gray
+                        2: np.array([0, 0, 255], dtype=np.uint8),        # Vehicle - Red (BGR)
+                        3: np.array([0, 255, 255], dtype=np.uint8),      # Sign - Yellow (BGR)
+                        4: np.array([255, 0, 255], dtype=np.uint8),      # Cyclist - Magenta (BGR)
+                        5: np.array([0, 255, 0], dtype=np.uint8),        # Pedestrian - Green (BGR)
                     }
                     
-                    for class_id, color in object_color_map.items():
-                        colored_annotation[annotation == class_id] = color
+                    for class_id, color in full_color_map.items():
+                        mask = annotation == class_id
+                        colored_annotation[mask] = color
 
                     vis_path = vis_dir / f"frame_{frame_id}.png"
                     cv2.imwrite(str(vis_path), colored_annotation)
@@ -324,8 +376,18 @@ class LiDARPNGAnnotationGenerator:
         print(f"\n🎯 LiDAR-Only Training Annotations:")
         print(f"   📥 Input: Enhanced lidar_png + SAM guidance")
         print(f"   🎨 Classes: Background(0), Ignore(1), Vehicle(2), Sign(3), Cyclist(4), Pedestrian(5)")
-        print(f"   🔧 Features: Distance-based ignore regions, dilated objects")
-        print(f"   📊 Visualization: Object annotations only (classes 2-5)")
+        print(f"   🔧 Features:")
+        print(f"      - Dynamic vertical ignore (adapts to object positions)")
+        print(f"      - Sparse LiDAR detection (< 30% density)")
+        print(f"      - Distance-based ignore (>60m)")
+        print(f"      - Object dilation for better supervision")
+        print(f"      - Edge rows cleared (prevents dilation artifacts)")
+        print(f"   📊 Background vs Ignore:")
+        print(f"      - Background (0): No LiDAR coverage (black in viz)")
+        print(f"      - Ignore (1): Edges beyond objects, sparse/distant LiDAR (gray in viz)")
+        print(f"   ✓ Consistent with camera-only ignore strategy")
+        print(f"   📊 Visualization: All classes visible")
+        print(f"      - Black = Background, Gray = Ignore, Colors = Objects")
         print(f"   🎯 Purpose: LiDAR-native annotations for LiDAR-only model training")
 
 

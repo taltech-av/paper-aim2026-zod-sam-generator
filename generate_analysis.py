@@ -338,8 +338,8 @@ Usage: python generate_analysis.py
     print("\n🎯 Selecting frames for training...")
 
     TARGET_TRAINING_FRAMES = 15000
-    TARGET_VALIDATION_FRAMES = 2500
-    MAX_TESTING_FRAMES_TOTAL = 2000  # Limit total testing frames across all conditions
+    TARGET_VALIDATION_FRAMES = 1000
+    MAX_TESTING_FRAMES_PER_CONDITION = 2000  # Maximum testing frames per condition
     VISUALIZATION_FRAMES_PER_CONDITION = 5
 
     # Collect all frames, sorted by quality score
@@ -359,24 +359,18 @@ Usage: python generate_analysis.py
     validation_frames = remaining_frames[:TARGET_VALIDATION_FRAMES]
     validation_frame_ids = {f['frame_id'] for f in validation_frames}
 
-    # Testing frames - limited to MAX_TESTING_FRAMES_TOTAL total
+    # Testing frames - allocate up to MAX_TESTING_FRAMES_PER_CONDITION per condition
     testing_frames = {condition: [] for condition in CONDITIONS}
     excluded_frame_ids = training_frame_ids | validation_frame_ids
 
-    # First, collect all available testing frames per condition
-    available_testing_frames = []
     for condition in CONDITIONS:
+        # Get remaining frames for this condition, sorted by quality
         remaining_condition_frames = [f for f in condition_data[condition] if f['frame_id'] not in excluded_frame_ids]
         remaining_condition_frames.sort(key=lambda x: -x['quality_score'])
-        for frame in remaining_condition_frames:
-            available_testing_frames.append((condition, frame))
 
-    # Select top MAX_TESTING_FRAMES_TOTAL testing frames
-    selected_testing_frames = available_testing_frames[:MAX_TESTING_FRAMES_TOTAL]
-
-    # Group by condition
-    for condition, frame in selected_testing_frames:
-        testing_frames[condition].append(frame['frame_id'])
+        # Select up to MAX_TESTING_FRAMES_PER_CONDITION frames for this condition
+        selected_count = min(MAX_TESTING_FRAMES_PER_CONDITION, len(remaining_condition_frames))
+        testing_frames[condition] = [f['frame_id'] for f in remaining_condition_frames[:selected_count]]
 
     # Visualization frames (5 per condition from remaining frames)
     print("\n🎨 Selecting visualization frames...")
@@ -496,6 +490,50 @@ Usage: python generate_analysis.py
                 "percentage": round(lidar_percentage, 2)
             })
 
+    # Calculate total pixel statistics across all conditions
+    total_pixel_stats = {
+        "camera": [],
+        "lidar": []
+    }
+    
+    # Sum up all pixels across conditions
+    total_camera_pixels = defaultdict(int)
+    total_lidar_pixels = defaultdict(int)
+    
+    for condition in CONDITIONS:
+        for class_idx in range(6):
+            camera_key = f'camera_class_{class_idx}'
+            lidar_key = f'lidar_class_{class_idx}'
+            
+            total_camera_pixels[class_idx] += condition_pixel_stats[condition].get(camera_key, 0)
+            total_lidar_pixels[class_idx] += condition_pixel_stats[condition].get(lidar_key, 0)
+    
+    # Calculate total pixels for percentage calculation
+    total_all_camera_pixels = sum(total_camera_pixels.values())
+    total_all_lidar_pixels = sum(total_lidar_pixels.values())
+    
+    # Create total arrays
+    for class_idx in range(6):
+        class_name = class_names.get(class_idx, f"unknown_{class_idx}")
+        
+        # Total camera
+        camera_pixels = total_camera_pixels[class_idx]
+        camera_percentage = (camera_pixels / total_all_camera_pixels * 100) if total_all_camera_pixels > 0 else 0
+        total_pixel_stats["camera"].append({
+            "class_name": class_name,
+            "pixel_count": camera_pixels,
+            "percentage": round(camera_percentage, 2)
+        })
+        
+        # Total LiDAR
+        lidar_pixels = total_lidar_pixels[class_idx]
+        lidar_percentage = (lidar_pixels / total_all_lidar_pixels * 100) if total_all_lidar_pixels > 0 else 0
+        total_pixel_stats["lidar"].append({
+            "class_name": class_name,
+            "pixel_count": lidar_pixels,
+            "percentage": round(lidar_percentage, 2)
+        })
+
     analysis_report = {
         "analysis_timestamp": datetime.now().isoformat(),
         "analysis_type": "Simple Pixel Counting Analysis",
@@ -503,11 +541,14 @@ Usage: python generate_analysis.py
         "conditions_analyzed": CONDITIONS,
         "condition_distribution": condition_distribution_array,
         "class_mapping": class_names,
-        "pixel_statistics": pixel_stats_arrays,
+        "pixel_statistics": {
+            "total": total_pixel_stats,
+            **pixel_stats_arrays
+        },
         "frame_selection": {
             "target_training_frames": TARGET_TRAINING_FRAMES,
             "target_validation_frames": TARGET_VALIDATION_FRAMES,
-            "max_testing_frames_total": MAX_TESTING_FRAMES_TOTAL,
+            "max_testing_frames_per_condition": MAX_TESTING_FRAMES_PER_CONDITION,
             "visualization_frames_per_condition": VISUALIZATION_FRAMES_PER_CONDITION,
             "training_frames": len(training_frame_ids),
             "validation_frames": len(validation_frame_ids),
@@ -539,7 +580,7 @@ Usage: python generate_analysis.py
     print(f"📊 Total frames analyzed: {total_all_frames}")
     print(f"🎯 Training frames selected: {len(training_frame_ids)}")
     print(f"✅ Validation frames selected: {len(validation_frame_ids)}")
-    print(f"🧪 Testing frames selected: {sum(len(testing_frames[c]) for c in CONDITIONS)} (max {MAX_TESTING_FRAMES_TOTAL} total)")
+    print(f"🧪 Testing frames selected: {sum(len(testing_frames[c]) for c in CONDITIONS)} (max {MAX_TESTING_FRAMES_PER_CONDITION} per condition)")
     print(f"📸 Visualization frames selected: {sum(len(visualization_frames[c]) for c in CONDITIONS)} ({VISUALIZATION_FRAMES_PER_CONDITION} per condition)")
     print(f"📋 All selected frames: {len(all_selected_frames)} (saved to all.txt)")
 
