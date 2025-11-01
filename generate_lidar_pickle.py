@@ -264,7 +264,7 @@ class LiDARDataGenerator:
 def main():
     # Configuration
     ZOD_ROOT = Path("/media/tom/ml/zod-data")
-    OUTPUT_ROOT = Path("/media/tom/ml/projects/clft-zod/output")
+    OUTPUT_ROOT = Path("/media/tom/ml/zod_temp")
     FRAMES_LIST = Path("/media/tom/ml/projects/clft-zod/frames_to_process.txt")
     
     print("="*60)

@@ -431,7 +431,7 @@ Usage examples:
     args = parser.parse_args()
 
     # Configuration
-    OUTPUT_ROOT = Path("/media/tom/ml/projects/clft-zod/output")
+    OUTPUT_ROOT = Path("/media/tom/ml/zod_temp")
 
     print("="*60)
     print("LiDAR PNG Annotation Generator")

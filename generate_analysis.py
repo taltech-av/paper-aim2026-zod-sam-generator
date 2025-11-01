@@ -34,7 +34,7 @@ from datetime import datetime
 import argparse
 
 # Paths
-OUTPUT_DIR = Path("output")
+OUTPUT_DIR = Path("/media/tom/ml/zod_temp")
 CAMERA_DIR = OUTPUT_DIR / "camera"
 LIDAR_PNG_DIR = OUTPUT_DIR / "lidar_png"
 CAMERA_ANNOTATION_DIR = OUTPUT_DIR / "annotation_camera_only"

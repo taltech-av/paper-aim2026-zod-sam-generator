@@ -491,8 +491,8 @@ Usage examples:
     )
     parser.add_argument('--visualize', action='store_true',
                        help='Create PNG visualizations for all processed frames')
-    parser.add_argument('--output-root', type=str, default='/media/tom/ml/projects/clft-zod/output',
-                       help='Root directory for all outputs (default: /media/tom/ml/projects/clft-zod/output)')
+    parser.add_argument('--output-root', type=str, default='/media/tom/ml/zod_temp',
+                       help='Root directory for all outputs (default: /media/tom/ml/zod_temp)')
     parser.add_argument('--sam-dir', type=str, default='annotation_sam',
                        help='Directory containing SAM annotations relative to output-root (default: annotation_sam)')
     parser.add_argument('--lidar-dir', type=str, default='lidar_png',

@@ -393,8 +393,8 @@ class GeometricLiDARProjector:
 
 def main():
     parser = argparse.ArgumentParser(description="Create geometric LiDAR projections")
-    parser.add_argument("--input_dir", default="output", help="Input directory")
-    parser.add_argument("--output_dir", default="output/lidar_png", help="Output directory")
+    parser.add_argument("--input_dir", default="/media/tom/ml/zod_temp", help="Input directory")
+    parser.add_argument("--output_dir", default="/media/tom/ml/zod_temp/lidar_png", help="Output directory")
     parser.add_argument("--frames_file", help="Frames file to process (optional - if not provided, processes all frames from metadata)")
     parser.add_argument("--verify", action="store_true", help="Verify geometric content")
     parser.add_argument("--enhanced", action="store_true", default=True, 

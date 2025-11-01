@@ -21,7 +21,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 # Paths
-SOURCE_BASE = Path("output")
+SOURCE_BASE = Path("/media/tom/ml/zod_temp")
 SPLIT_FILE = SOURCE_BASE / "splits" / "all.txt"
 DEST_BASE = Path("/media/tom/ml/zod_dataset")
 

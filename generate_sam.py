@@ -621,7 +621,7 @@ def main():
     
     parser.add_argument('--dataset-root', type=str, default='/media/tom/ml/zod-data',
                        help='Path to ZOD dataset root')
-    parser.add_argument('--output-root', type=str, default='./output',
+    parser.add_argument('--output-root', type=str, default='/media/tom/ml/zod_temp',
                        help='Output directory')
     parser.add_argument('--frame-list', type=str, default='frames_to_process.txt',
                        help='Path to frames_to_process.txt')
