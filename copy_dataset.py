@@ -47,7 +47,7 @@ def extract_frame_id(path_str):
 def copy_splits_directory(dry_run=False):
     """Copy the entire splits directory"""
     src_splits = SOURCE_BASE / "splits"
-    dest_splits = DEST_BASE / "splits"
+    dest_splits = DEST_BASE
 
     if not src_splits.exists():
         print(f"⚠️  Warning: Splits directory not found: {src_splits}")
