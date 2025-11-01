@@ -44,7 +44,7 @@ class LiDARPNGAnnotationGenerator:
         self.sam_annotation_dir = self.output_root / "annotation_sam"
 
         # Output directory for LiDAR annotations
-        self.lidar_annotation_dir = self.output_root / "annotation_lidar_png"
+        self.lidar_annotation_dir = self.output_root / "annotation_lidar_only"
         self.lidar_annotation_dir.mkdir(parents=True, exist_ok=True)
 
         # Progress tracking

@@ -8,6 +8,7 @@ training dataset in /media/tom/ml/zod_dataset.
 Copies from:
 - annotation_camera_only/ -> annotation_camera_only/
 - annotation_lidar_only/ -> annotation_lidar_only/
+- annotation_fusion/ -> annotation_fusion/
 - camera/ -> camera/
 - lidar_png/ -> lidar_png/
 
@@ -28,6 +29,7 @@ DEST_BASE = Path("/media/tom/ml/zod_dataset")
 SOURCE_DIRS = {
     "annotation_camera_only": SOURCE_BASE / "annotation_camera_only",
     "annotation_lidar_only": SOURCE_BASE / "annotation_lidar_only",
+    "annotation_fusion": SOURCE_BASE / "annotation_fusion",
     "camera": SOURCE_BASE / "camera",
     "lidar_png": SOURCE_BASE / "lidar_png"
 }

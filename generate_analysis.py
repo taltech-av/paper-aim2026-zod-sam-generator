@@ -5,12 +5,21 @@ Simplified Pixel Counting Analysis for CLFT-ZOD Dataset
 Counts pixels per class in annotations, aggregates statistics by weather condition,
 and selects optimal frames for training, validation, and testing.
 
+**Updated for Dynamic Annotation Strategy:**
+- Background (0): Negative training samples (loss applied)
+- Ignore (1): Uncertain regions (loss masked, ~20-60% per frame, scene-adaptive)
+- Objects (2-5): Vehicle, Sign, Cyclist, Pedestrian
+- Annotations now use dynamic vertical edge ignore zones
+- No object interior holes (quality checks only on background)
+- Consistent camera/LiDAR/fusion strategies
+
 Features:
 - Pixel counting per class (background, ignore, vehicle, sign, cyclist, pedestrian)
 - Weather condition analysis (day_fair, day_rain, night_fair, night_rain)
 - Class presence statistics across conditions
 - Quality-based frame selection for training splits
 - Comprehensive reporting and split file generation
+- Analyzes ignore region effectiveness
 
 Usage: python generate_analysis.py
 """
@@ -65,6 +74,99 @@ def count_pixels_simple(annotation_path):
         print(f"Error counting pixels for {annotation_path}: {e}")
         return None
 
+
+def calculate_image_statistics(frame_ids, sample_size=None):
+    """Calculate mean and std for image normalization
+    
+    Args:
+        frame_ids: List of frame IDs to sample from
+        sample_size: Number of images to sample (None = use all frames)
+    
+    Returns:
+        dict with mean and std for camera and lidar images
+    """
+    # Use all frames if sample_size is None or exceeds available frames
+    if sample_size is None or sample_size >= len(frame_ids):
+        sampled_ids = list(frame_ids)
+        sample_size = len(frame_ids)
+    else:
+        # Sample random frames
+        import random
+        sampled_ids = random.sample(list(frame_ids), sample_size)
+    
+    print(f"\n📊 Calculating image statistics for normalization...")
+    print(f"   Processing {sample_size:,} images (out of {len(frame_ids):,} available)...")
+    if sample_size == len(frame_ids):
+        print(f"   ✓ Using ENTIRE training dataset for maximum accuracy")
+    
+    # Accumulators for camera images (RGB)
+    camera_pixel_sum = np.zeros(3, dtype=np.float64)
+    camera_pixel_sq_sum = np.zeros(3, dtype=np.float64)
+    camera_pixel_count = 0
+    
+    # Accumulators for LiDAR images (3-channel geometric)
+    lidar_pixel_sum = np.zeros(3, dtype=np.float64)
+    lidar_pixel_sq_sum = np.zeros(3, dtype=np.float64)
+    lidar_pixel_count = 0
+    
+    for frame_id in tqdm(sampled_ids, desc="Computing statistics"):
+        # Camera image
+        camera_path = CAMERA_DIR / f"frame_{frame_id}.png"
+        if camera_path.exists():
+            img = cv2.imread(str(camera_path))
+            if img is not None:
+                # Convert BGR to RGB
+                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                # Normalize to [0, 1]
+                img_norm = img_rgb.astype(np.float64) / 255.0
+                
+                # Accumulate statistics
+                camera_pixel_sum += img_norm.sum(axis=(0, 1))
+                camera_pixel_sq_sum += (img_norm ** 2).sum(axis=(0, 1))
+                camera_pixel_count += img_norm.shape[0] * img_norm.shape[1]
+        
+        # LiDAR image
+        lidar_path = LIDAR_PNG_DIR / f"frame_{frame_id}.png"
+        if lidar_path.exists():
+            img = cv2.imread(str(lidar_path), cv2.IMREAD_UNCHANGED)
+            if img is not None and len(img.shape) == 3:
+                # Normalize to [0, 1]
+                img_norm = img.astype(np.float64) / 255.0
+                
+                # Only count non-zero pixels (actual LiDAR points)
+                mask = np.any(img > 0, axis=2)
+                if np.any(mask):
+                    lidar_pixel_sum += img_norm[mask].sum(axis=0)
+                    lidar_pixel_sq_sum += (img_norm[mask] ** 2).sum(axis=0)
+                    lidar_pixel_count += mask.sum()
+    
+    # Calculate mean and std for camera
+    camera_mean = camera_pixel_sum / camera_pixel_count
+    camera_std = np.sqrt(camera_pixel_sq_sum / camera_pixel_count - camera_mean ** 2)
+    
+    # Calculate mean and std for LiDAR (only where there's actual data)
+    if lidar_pixel_count > 0:
+        lidar_mean = lidar_pixel_sum / lidar_pixel_count
+        lidar_std = np.sqrt(lidar_pixel_sq_sum / lidar_pixel_count - lidar_mean ** 2)
+    else:
+        lidar_mean = np.zeros(3)
+        lidar_std = np.ones(3)
+    
+    return {
+        'camera': {
+            'mean': camera_mean.tolist(),
+            'std': camera_std.tolist(),
+            'sample_size': len(sampled_ids),
+            'pixel_count': camera_pixel_count
+        },
+        'lidar': {
+            'mean': lidar_mean.tolist(),
+            'std': lidar_std.tolist(),
+            'sample_size': len(sampled_ids),
+            'pixel_count': lidar_pixel_count
+        }
+    }
+
 def main():
     parser = argparse.ArgumentParser(
         description="Simple pixel counting analysis for weather-based frame selection",
@@ -83,11 +185,17 @@ Outputs:
 - Pixel counts per class per weather condition
 - Class presence statistics
 - Weather-specific train/val/test splits
+- Image normalization statistics (mean/std)
 - Comprehensive analysis report
 
-Usage: python generate_analysis.py
+Usage: 
+  python generate_analysis.py
+  python generate_analysis.py --norm-samples 5000  # Use more samples for normalization
+  python generate_analysis.py --norm-samples 0     # Use ALL training frames (slow but accurate)
         """
     )
+    parser.add_argument('--norm-samples', type=int, default=0,
+                       help='Number of images to sample for normalization statistics (0 = use ALL training frames for max accuracy, default: 0)')
     args = parser.parse_args()
 
     print("=" * 60)
@@ -190,6 +298,10 @@ Usage: python generate_analysis.py
             has_cyclist = 4 in camera_stats['classes_present']
             has_pedestrian = 5 in camera_stats['classes_present']
 
+            # Calculate ignore percentage (for reporting)
+            ignore_pixels = camera_stats['pixel_counts'].get(1, 0)
+            ignore_percentage = (ignore_pixels / camera_stats['total_pixels'] * 100) if camera_stats['total_pixels'] > 0 else 0
+
             # Basic quality score (0-100)
             quality_score = 0
             if has_vehicle:
@@ -205,9 +317,14 @@ Usage: python generate_analysis.py
             quality_score += min(camera_stats['num_classes'] * 10, 30)
 
             # Penalty for too much/too little foreground
+            # Note: With dynamic ignore strategy, foreground % varies by scene
             fg_pct = camera_stats['foreground_percentage']
-            if not (5 <= fg_pct <= 50):
-                quality_score *= 0.7
+            if not (3 <= fg_pct <= 60):  # Wider range for dynamic annotations
+                quality_score *= 0.8
+
+            # Bonus for reasonable ignore percentage (20-60% is expected with dynamic strategy)
+            if 15 <= ignore_percentage <= 65:
+                quality_score *= 1.1  # Slight bonus for well-balanced ignore regions
 
             frame_info = {
                 'frame_id': frame_id,
@@ -219,6 +336,7 @@ Usage: python generate_analysis.py
                 'has_sign': has_sign,
                 'has_cyclist': has_cyclist,
                 'has_pedestrian': has_pedestrian,
+                'ignore_percentage': ignore_percentage,  # Track ignore percentage
             }
 
             condition_data[condition].append(frame_info)
@@ -266,11 +384,21 @@ Usage: python generate_analysis.py
 
     class_names = {
         0: "background",
-        1: "ignore",
+        1: "ignore",  # Dynamic scene-adaptive ignore regions (20-60% per frame)
         2: "vehicle",
         3: "sign",
         4: "cyclist",
         5: "pedestrian"
+    }
+
+    # Class descriptions for reporting
+    class_descriptions = {
+        0: "Background (negative training samples, loss applied)",
+        1: "Ignore (uncertain regions, loss masked, scene-adaptive)",
+        2: "Vehicle (objects, full annotations preserved)",
+        3: "Sign (objects, full annotations preserved)",
+        4: "Cyclist (objects, full annotations preserved)",
+        5: "Pedestrian (objects, full annotations preserved)"
     }
 
     # Aggregate pixel counts per condition
@@ -287,8 +415,8 @@ Usage: python generate_analysis.py
                 condition_pixel_stats[condition][f'lidar_class_{class_id}'] += count
 
     # Display pixel statistics
-    print(f"{'Condition':<12} {'Class':<12} {'Camera Pixels':>15} {'LiDAR Pixels':>15} {'Total Pixels':>15} {'Percentage':>10}")
-    print("-" * 95)
+    print(f"{'Condition':<12} {'Class':<15} {'Camera Pixels':>15} {'LiDAR Pixels':>15} {'Total Pixels':>15} {'Percentage':>10}")
+    print("-" * 100)
 
     for condition in CONDITIONS:
         print(f"\n{condition}:")
@@ -308,9 +436,36 @@ Usage: python generate_analysis.py
 
             if total_pixels > 0:  # Only show classes with pixels
                 percentage = (total_pixels / total_condition_pixels * 100) if total_condition_pixels > 0 else 0
-                print(f"{'':<12} {class_names[class_id]:<12} {camera_pixels:>15,} {lidar_pixels:>15,} {total_pixels:>15,} {percentage:>9.1f}%")
+                class_label = class_names[class_id]
+                # Add annotation for ignore class
+                if class_id == 1:
+                    class_label += " ⚠️"  # Mark ignore class
+                print(f"{'':<12} {class_label:<15} {camera_pixels:>15,} {lidar_pixels:>15,} {total_pixels:>15,} {percentage:>9.1f}%")
 
-        print(f"{'':<12} {'TOTAL':<12} {'-':>15} {'-':>15} {total_condition_pixels:>15,} {'100.0%':>10}")
+        print(f"{'':<12} {'TOTAL':<15} {'-':>15} {'-':>15} {total_condition_pixels:>15,} {'100.0%':>10}")
+
+    # Add ignore region statistics
+    print("\n📊 Ignore Region Statistics (Dynamic Scene-Adaptive Strategy):")
+    print("=" * 60)
+    
+    for condition in CONDITIONS:
+        frames = condition_data[condition]
+        if not frames:
+            continue
+        
+        ignore_percentages = [f['ignore_percentage'] for f in frames if 'ignore_percentage' in f]
+        if ignore_percentages:
+            avg_ignore = np.mean(ignore_percentages)
+            min_ignore = np.min(ignore_percentages)
+            max_ignore = np.max(ignore_percentages)
+            median_ignore = np.median(ignore_percentages)
+            
+            print(f"{condition}:")
+            print(f"  Average ignore: {avg_ignore:.1f}%")
+            print(f"  Median ignore:  {median_ignore:.1f}%")
+            print(f"  Range:          {min_ignore:.1f}% - {max_ignore:.1f}%")
+            print(f"  (Expected: 20-60% with dynamic vertical edge strategy)")
+            print()
 
     # Class presence statistics
     print("\n📊 Class Presence Statistics:")
@@ -358,6 +513,11 @@ Usage: python generate_analysis.py
     remaining_frames = all_frames[TARGET_TRAINING_FRAMES:]
     validation_frames = remaining_frames[:TARGET_VALIDATION_FRAMES]
     validation_frame_ids = {f['frame_id'] for f in validation_frames}
+    
+    # Calculate image statistics for normalization (using training frames)
+    # Use args.norm_samples (0 = all frames, >0 = sample that many)
+    norm_sample_size = len(training_frame_ids) if args.norm_samples == 0 else args.norm_samples
+    image_stats = calculate_image_statistics(training_frame_ids, sample_size=norm_sample_size)
 
     # Testing frames - allocate up to MAX_TESTING_FRAMES_PER_CONDITION per condition
     testing_frames = {condition: [] for condition in CONDITIONS}
@@ -473,11 +633,14 @@ Usage: python generate_analysis.py
             lidar_pixels = condition_pixel_stats[condition].get(lidar_key, 0)
 
             class_name = class_names.get(class_idx, f"unknown_{class_idx}")
+            class_description = class_descriptions.get(class_idx, "")
 
             # Camera array entry
             camera_percentage = (camera_pixels / total_condition_pixels * 100) if total_condition_pixels > 0 else 0
             pixel_stats_arrays[condition]["camera"].append({
+                "class_id": class_idx,
                 "class_name": class_name,
+                "class_description": class_description,
                 "pixel_count": camera_pixels,
                 "percentage": round(camera_percentage, 2)
             })
@@ -485,7 +648,9 @@ Usage: python generate_analysis.py
             # LiDAR array entry
             lidar_percentage = (lidar_pixels / total_condition_pixels * 100) if total_condition_pixels > 0 else 0
             pixel_stats_arrays[condition]["lidar"].append({
+                "class_id": class_idx,
                 "class_name": class_name,
+                "class_description": class_description,
                 "pixel_count": lidar_pixels,
                 "percentage": round(lidar_percentage, 2)
             })
@@ -515,12 +680,15 @@ Usage: python generate_analysis.py
     # Create total arrays
     for class_idx in range(6):
         class_name = class_names.get(class_idx, f"unknown_{class_idx}")
+        class_description = class_descriptions.get(class_idx, "")
         
         # Total camera
         camera_pixels = total_camera_pixels[class_idx]
         camera_percentage = (camera_pixels / total_all_camera_pixels * 100) if total_all_camera_pixels > 0 else 0
         total_pixel_stats["camera"].append({
+            "class_id": class_idx,
             "class_name": class_name,
+            "class_description": class_description,
             "pixel_count": camera_pixels,
             "percentage": round(camera_percentage, 2)
         })
@@ -529,7 +697,9 @@ Usage: python generate_analysis.py
         lidar_pixels = total_lidar_pixels[class_idx]
         lidar_percentage = (lidar_pixels / total_all_lidar_pixels * 100) if total_all_lidar_pixels > 0 else 0
         total_pixel_stats["lidar"].append({
+            "class_id": class_idx,
             "class_name": class_name,
+            "class_description": class_description,
             "pixel_count": lidar_pixels,
             "percentage": round(lidar_percentage, 2)
         })
@@ -541,6 +711,22 @@ Usage: python generate_analysis.py
         "conditions_analyzed": CONDITIONS,
         "condition_distribution": condition_distribution_array,
         "class_mapping": class_names,
+        "image_normalization": {
+            "camera": {
+                "mean": [round(v, 6) for v in image_stats['camera']['mean']],
+                "std": [round(v, 6) for v in image_stats['camera']['std']],
+                "channels": ["R", "G", "B"],
+                "sample_size": image_stats['camera']['sample_size'],
+                "note": "Use these values for transforms.Normalize(mean=..., std=...)"
+            },
+            "lidar": {
+                "mean": [round(v, 6) for v in image_stats['lidar']['mean']],
+                "std": [round(v, 6) for v in image_stats['lidar']['std']],
+                "channels": ["X", "Y", "Z"],
+                "sample_size": image_stats['lidar']['sample_size'],
+                "note": "LiDAR geometric projection normalization (X, Y, Z coordinates)"
+            }
+        },
         "pixel_statistics": {
             "total": total_pixel_stats,
             **pixel_stats_arrays
@@ -583,6 +769,21 @@ Usage: python generate_analysis.py
     print(f"🧪 Testing frames selected: {sum(len(testing_frames[c]) for c in CONDITIONS)} (max {MAX_TESTING_FRAMES_PER_CONDITION} per condition)")
     print(f"📸 Visualization frames selected: {sum(len(visualization_frames[c]) for c in CONDITIONS)} ({VISUALIZATION_FRAMES_PER_CONDITION} per condition)")
     print(f"📋 All selected frames: {len(all_selected_frames)} (saved to all.txt)")
+    
+    print("\n📊 Image Normalization Values (for training):")
+    print("=" * 60)
+    print("Camera (RGB):")
+    print(f"  Mean: {[round(v, 6) for v in image_stats['camera']['mean']]}")
+    print(f"  Std:  {[round(v, 6) for v in image_stats['camera']['std']]}")
+    print(f"  Sample: {image_stats['camera']['sample_size']} images")
+    print("\nLiDAR (X, Y, Z):")
+    print(f"  Mean: {[round(v, 6) for v in image_stats['lidar']['mean']]}")
+    print(f"  Std:  {[round(v, 6) for v in image_stats['lidar']['std']]}")
+    print(f"  Sample: {image_stats['lidar']['sample_size']} images")
+    print("\nUsage in PyTorch:")
+    print("  transforms.Normalize(")
+    print(f"      mean={[round(v, 4) for v in image_stats['camera']['mean']]},")
+    print(f"      std={[round(v, 4) for v in image_stats['camera']['std']]})")
 
     print("\n✅ Simple pixel counting analysis complete!")
 
