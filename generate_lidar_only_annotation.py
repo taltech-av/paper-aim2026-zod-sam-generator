@@ -24,8 +24,10 @@ from pathlib import Path
 import cv2
 from tqdm import tqdm
 import argparse
-from scipy import ndimage
-import json
+import concurrent.futures
+import multiprocessing
+from functools import partial
+import time
 
 
 class LiDARPNGAnnotationGenerator:
@@ -42,6 +44,7 @@ class LiDARPNGAnnotationGenerator:
         # Input directories
         self.lidar_png_dir = self.output_root / "lidar_png"  # Use enhanced version
         self.sam_annotation_dir = self.output_root / "annotation_sam"
+        self.camera_dir = self.output_root / "camera"  # Add camera images for comparison
 
         # Output directory for LiDAR annotations
         self.lidar_annotation_dir = self.output_root / "annotation_lidar_only"
@@ -90,9 +93,33 @@ class LiDARPNGAnnotationGenerator:
         print(f"✓ Remaining to process: {len(self.frame_ids):,}")
 
         # LiDAR annotation parameters
-        self.density_threshold = 0.30  # 30% density threshold for sparse regions (was 5%, too low for enhanced data)
-        self.distance_threshold = 60.0  # Points beyond 60m become ignore
+        self.density_threshold = 0.15  # 15% density threshold for sparse regions (more permissive now)
+        self.distance_threshold = 70.0  # Points beyond 70m become ignore (conservative for training)
         self.dilation_iterations = 3  # More dilation for enhanced lidar_png
+        self.adaptive_dilation = True  # Use adaptive dilation based on object characteristics
+        
+        # Performance optimization parameters
+        self.max_workers = min(multiprocessing.cpu_count(), 8)  # Limit to 8 workers max
+        self.batch_size = 50  # Process frames in batches to manage memory
+
+    def compute_density_map_efficient(self, lidar_coverage, window_size=7):
+        """Compute density map using efficient sliding window approach
+        
+        Args:
+            lidar_coverage: Boolean array indicating LiDAR coverage
+            window_size: Size of sliding window for density calculation
+            
+        Returns:
+            density_map: Float array with local density values
+        """
+        # Use uniform filter for faster density calculation
+        kernel = np.ones((window_size, window_size), dtype=np.float32) / (window_size * window_size)
+        density_map = cv2.filter2D(lidar_coverage.astype(np.float32), -1, kernel, borderType=cv2.BORDER_CONSTANT)
+        
+        # Clip to [0, 1] range
+        density_map = np.clip(density_map, 0, 1)
+        
+        return density_map
 
     def load_enhanced_lidar_png(self, frame_id):
         """Load enhanced LiDAR geometric projection"""
@@ -113,13 +140,22 @@ class LiDARPNGAnnotationGenerator:
         annotation = cv2.imread(str(sam_path), cv2.IMREAD_GRAYSCALE)
         return annotation
 
+    def load_camera_image(self, frame_id):
+        """Load camera image for visualization comparison"""
+        camera_path = self.camera_dir / f"frame_{frame_id}.png"
+        if not camera_path.exists():
+            return None
+
+        camera_img = cv2.imread(str(camera_path), cv2.IMREAD_COLOR)
+        return camera_img
+
     def create_lidar_native_annotation(self, enhanced_lidar_img, sam_annotation):
         """Create LiDAR-native annotation using lidar_png and SAM guidance
 
         Strategy:
-        1. Use lidar_png for LiDAR coverage and geometric analysis
+        1. Use lidar_png for LiDAR coverage (permissive to match enhanced PNG content)
         2. Use SAM as ground truth for object locations and types
-        3. Map SAM-identified objects onto actual LiDAR points
+        3. Map SAM-identified objects onto LiDAR-covered regions
         4. Create LiDAR-native segmentation with proper class distinctions
 
         Args:
@@ -142,14 +178,25 @@ class LiDARPNGAnnotationGenerator:
         y_channel = enhanced_lidar_img[:, :, 1].astype(float)  # Y coordinates (normalized)
         z_channel = enhanced_lidar_img[:, :, 2].astype(float)  # Z coordinates (depth, normalized)
 
-        # Create LiDAR coverage mask (any non-zero channel indicates LiDAR presence)
-        lidar_coverage = np.any(enhanced_lidar_img > 0, axis=2)
+        # Create LiDAR coverage mask that aligns with enhanced LiDAR PNG
+        # The enhanced LiDAR PNG applies smoothing and dilation, so we should accept
+        # regions where ANY channel has meaningful data (not require ALL channels)
+        
+        # More permissive coverage: accept regions where LiDAR PNG has data
+        # This ensures annotations align with actual LiDAR PNG content
+        lidar_coverage = np.any(enhanced_lidar_img > 5, axis=2)  # Any channel > 5 (permissive)
+        
+        # For stricter validation, also check that we don't have extremely distant points
+        # that are likely just smoothing artifacts - be more conservative for training
+        z_channel_norm = z_channel / 255.0
+        distance_approx = np.exp(z_channel_norm * np.log(101.0))
+        reasonable_distance = distance_approx < 80.0  # Conservative: max 80m for training
+        
+        # Final coverage: has LiDAR data AND not extremely distant
+        lidar_coverage = lidar_coverage & reasonable_distance
 
-        # Decode distance from enhanced normalization
-        # From enhanced method: z_norm = np.clip(z_log / np.log(101.0), 0, 1) * 255
-        # This is more complex due to logarithmic scaling, approximate inverse
+        # Decode distance from enhanced normalization for density calculations
         z_norm = z_channel / 255.0
-        # Approximate inverse log scaling (not perfect but good enough for thresholding)
         distance_map = np.exp(z_norm * np.log(101.0))
 
         # 1. Background class (0): Areas with no LiDAR coverage
@@ -157,13 +204,8 @@ class LiDARPNGAnnotationGenerator:
 
         # 2. Ignore class (1): Sparse LiDAR regions, distant points, AND edge regions
         # Strategy A: Sparse/distant detection (quality-based ignore)
-        # Create density map using gaussian filter for local coverage analysis
-        lidar_density = ndimage.gaussian_filter(
-            lidar_coverage.astype(float),
-            sigma=3,  # Smaller sigma for enhanced data
-            mode='constant',
-            cval=0
-        )
+        # Create density map using efficient sliding window approach
+        lidar_density = self.compute_density_map_efficient(lidar_coverage.astype(np.uint8))
 
         # Areas with sparse LiDAR coverage (< 30% local density)
         # BUT only where we actually have some LiDAR points
@@ -172,40 +214,61 @@ class LiDARPNGAnnotationGenerator:
         # Areas beyond distance threshold (approximate)
         distant_regions = (distance_map > self.distance_threshold) & lidar_coverage
 
-        # Strategy B: Dynamic vertical edge regions (consistency with camera)
-        # Find topmost and bottommost objects from SAM to define usable region
-        has_any_object = np.isin(sam_annotation, [2, 3, 4, 5])
+        # Strategy B: Minimal vertical edge regions (conservative for LiDAR)
+        # LiDAR covers the scene well, so use minimal edge strips
         vertical_edge_regions = np.zeros_like(sam_annotation, dtype=bool)
         
-        if np.any(has_any_object):
-            rows_with_objects = np.any(has_any_object, axis=1)
-            object_rows = np.where(rows_with_objects)[0]
-            
-            if len(object_rows) > 0:
-                topmost_object = object_rows[0]
-                bottommost_object = object_rows[-1]
-                
-                # Add margin beyond objects (2% of height as safety margin)
-                margin = max(int(h * 0.02), 10)
-                
-                # Mark regions BEYOND objects as ignore
-                top_ignore_line = max(0, topmost_object - margin)
-                bottom_ignore_line = min(h, bottommost_object + margin)
-                
-                vertical_edge_regions[:top_ignore_line, :] = True  # Above objects
-                vertical_edge_regions[bottom_ignore_line:, :] = True  # Below objects
+        # Only mark tiny edge strips (1% of height) as ignore for safety
+        edge_fraction = 0.01  # Minimal edges
+        edge_height = max(int(h * edge_fraction), 5)  # At least 5 pixels
+        
+        vertical_edge_regions[:edge_height, :] = True  # Top 1%
+        vertical_edge_regions[-edge_height:, :] = True  # Bottom 1%
         
         # Combine all ignore criteria
         ignore_regions = sparse_regions | distant_regions | vertical_edge_regions
         annotation[ignore_regions] = 1
 
         # 3. Objects from SAM guidance: Map onto LiDAR points
-        # Only mark LiDAR points that fall within SAM object regions
+        # LiDAR-native approach: Only annotate where LiDAR points actually exist
+        # This ensures training targets match available input data
+        
+        # Quality thresholds for LiDAR-native object detection
+        min_density_for_object = 0.20  # 20% density minimum for objects
+        min_region_size = 8  # Minimum connected region size
+        max_distance_for_full_mask = 40.0  # Maximum distance for full SAM masks
+        
+        # For each SAM object class, only annotate LiDAR points that:
+        # 1. Have sufficient local density
+        # 2. Are at reasonable distance  
+        # 3. Actually exist (have LiDAR coverage)
+        # 4. Are not in ignore regions
         for sam_class_id in [2, 3, 4, 5]:  # vehicle, sign, cyclist, pedestrian
             sam_class_mask = (sam_annotation == sam_class_id)
-            # Only apply where we have LiDAR coverage AND it's not an ignore region
-            lidar_in_class = sam_class_mask & lidar_coverage & ~ignore_regions
-            annotation[lidar_in_class] = sam_class_id  # Preserve SAM class
+            
+            # Only annotate where LiDAR points actually exist
+            sam_lidar_overlap = sam_class_mask & lidar_coverage
+            
+            if np.sum(sam_lidar_overlap) >= min_region_size:
+                # Within the LiDAR-covered SAM regions, apply quality filtering
+                overlap_pixels = np.sum(sam_lidar_overlap)
+                
+                # Check quality criteria for the LiDAR-covered regions
+                overlap_density = lidar_density[sam_lidar_overlap]
+                overlap_distances = distance_map[sam_lidar_overlap]
+                
+                # Quality mask: only high-quality LiDAR points get object labels
+                quality_mask = np.zeros_like(sam_lidar_overlap, dtype=bool)
+                quality_mask[sam_lidar_overlap] = (
+                    (overlap_density >= min_density_for_object) & 
+                    (overlap_distances <= max_distance_for_full_mask)
+                )
+                
+                # Apply to non-ignore regions
+                final_mask = quality_mask & ~ignore_regions
+                
+                if np.sum(final_mask) >= min_region_size:
+                    annotation[final_mask] = sam_class_id
 
         # 4. Final cleanup: Ensure areas without LiDAR coverage are background
         # But preserve ignore regions that have sparse LiDAR coverage
@@ -215,44 +278,170 @@ class LiDARPNGAnnotationGenerator:
 
         return annotation
 
-    def dilate_object_regions(self, annotation):
-        """Dilate object regions to provide more supervision signal for enhanced lidar data"""
-        if annotation is None:
+    def dilate_object_regions(self, annotation, enhanced_lidar_img):
+        """Dilate object regions with adaptive strategy for sparse LiDAR data
+        
+        Uses different dilation strategies based on object type and characteristics:
+        - Signs: More aggressive dilation (small objects, sparse points)
+        - Vehicles: Moderate dilation (larger objects)
+        - Distance-based: Closer objects get more dilation
+        """
+        if annotation is None or enhanced_lidar_img is None:
             return None
 
+        if not self.adaptive_dilation:
+            # Fallback to simple dilation if adaptive is disabled
+            dilated = annotation.copy()
+            for class_id in [2, 3, 4, 5]:
+                obj_mask = (annotation == class_id)
+                if np.any(obj_mask):
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                    dilated_mask = cv2.dilate(obj_mask.astype(np.uint8), kernel, iterations=self.dilation_iterations)
+                    valid_expansion = dilated_mask & ((annotation == 0) | (annotation == 1))
+                    dilated[valid_expansion] = class_id
+            return dilated
+
         dilated = annotation.copy()
+        h, w = annotation.shape
 
-        # Dilate each object class separately to avoid conflicts
-        for class_id in [2, 3, 4, 5]:  # vehicle, sign, cyclist, pedestrian
+        # Extract distance information for adaptive dilation
+        x_channel = enhanced_lidar_img[:, :, 0].astype(float)
+        y_channel = enhanced_lidar_img[:, :, 1].astype(float) 
+        z_channel = enhanced_lidar_img[:, :, 2].astype(float)
+        
+        z_norm = z_channel / 255.0
+        distance_map = np.exp(z_norm * np.log(101.0))
+
+        # Class-specific dilation parameters
+        dilation_params = {
+            2: {'kernel_size': 7, 'iterations': 4, 'name': 'Vehicle'},      # Vehicles - moderate
+            3: {'kernel_size': 9, 'iterations': 6, 'name': 'Sign'},         # Signs - aggressive (sparse!)
+            4: {'kernel_size': 5, 'iterations': 3, 'name': 'Cyclist'},     # Cyclists - minimal
+            5: {'kernel_size': 5, 'iterations': 3, 'name': 'Pedestrian'}   # Pedestrians - minimal
+        }
+
+        # Track dilation statistics
+        dilation_stats = {}
+
+        for class_id, params in dilation_params.items():
             obj_mask = (annotation == class_id)
-
+            
             if np.any(obj_mask):
-                # Use morphological dilation to expand objects (more iterations for enhanced data)
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                dilated_mask = cv2.dilate(obj_mask.astype(np.uint8),
-                                        kernel, iterations=self.dilation_iterations)
+                # Calculate object characteristics for adaptive dilation
+                obj_pixels = np.sum(obj_mask)
+                
+                # Distance-based scaling: closer objects get more dilation
+                obj_distances = distance_map[obj_mask]
+                if len(obj_distances) > 0:
+                    median_distance = np.median(obj_distances)
+                    # Closer objects (lower distance) get more dilation
+                    distance_factor = max(0.5, 2.0 - median_distance / 50.0)  # 0.5x to 2.0x scaling
+                else:
+                    distance_factor = 1.0
+                
+                # Size-based scaling: smaller objects get more dilation
+                size_factor = 1.0
+                if obj_pixels < 10:  # Very small objects
+                    size_factor = 2.0
+                elif obj_pixels < 25:  # Small objects
+                    size_factor = 1.5
+                
+                # Apply adaptive scaling
+                adaptive_iterations = max(1, int(params['iterations'] * distance_factor * size_factor))
+                adaptive_kernel_size = max(3, int(params['kernel_size'] * size_factor))
+                
+                # Ensure odd kernel size
+                if adaptive_kernel_size % 2 == 0:
+                    adaptive_kernel_size += 1
+                
+                # Apply adaptive dilation
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (adaptive_kernel_size, adaptive_kernel_size))
+                dilated_mask = cv2.dilate(obj_mask.astype(np.uint8), kernel, iterations=adaptive_iterations)
 
                 # Only expand into background/ignore regions (don't overwrite other objects)
-                valid_expansion = dilated_mask & ((annotation == 0) | (annotation == 1))
+                valid_expansion = dilated_mask & ((dilated == 0) | (dilated == 1))
                 dilated[valid_expansion] = class_id
 
-        # Force edge rows to background to prevent dilation artifacts
-        # Dynamic edge clearing based on dilation radius
-        edge_rows = self.dilation_iterations * 2 + 1  # Kernel radius * 2 + 1 for safety
+                # Track statistics
+                dilation_stats[class_id] = {
+                    'original_pixels': obj_pixels,
+                    'median_distance': median_distance if len(obj_distances) > 0 else 0,
+                    'distance_factor': distance_factor,
+                    'size_factor': size_factor,
+                    'final_iterations': adaptive_iterations,
+                    'final_kernel': adaptive_kernel_size,
+                    'expanded_pixels': np.sum(valid_expansion)
+                }
+
+        # Print dilation statistics (only for frames with objects, and not too frequently)
+        # if dilation_stats and np.random.random() < 0.01:  # 1% chance to print stats
+        #     print("  📊 Adaptive Dilation Stats:")
+        #     for class_id, stats in dilation_stats.items():
+        #         class_name = dilation_params[class_id]['name']
+        #         print(f"    {class_name}: {stats['original_pixels']}px → {stats['expanded_pixels']}px "
+        #               f"(dist:{stats['median_distance']:.1f}m, iter:{stats['final_iterations']}, k:{stats['final_kernel']})")
+
+        # Edge clearing (same as before)
+        edge_rows = max(self.dilation_iterations, 3) * 2 + 1
         
-        # But check if we have objects near edges - if so, use minimal clearing
-        h = dilated.shape[0]
         has_objects_top = np.any(np.isin(dilated[edge_rows:edge_rows*2, :], [2, 3, 4, 5]))
         has_objects_bottom = np.any(np.isin(dilated[-edge_rows*2:-edge_rows, :], [2, 3, 4, 5]))
         
-        # Clear fewer rows if objects are near edges (to preserve them)
         top_clear = 2 if has_objects_top else edge_rows
         bottom_clear = 2 if has_objects_bottom else edge_rows
         
-        dilated[:top_clear, :] = 0  # Top rows
-        dilated[-bottom_clear:, :] = 0  # Bottom rows
+        dilated[:top_clear, :] = 0
+        dilated[-bottom_clear:, :] = 0
 
         return dilated
+
+    def create_overlay_visualization(self, base_image, colored_mask, title=""):
+        """Create overlay visualization with title
+        
+        Args:
+            base_image: Base image (LiDAR or camera)
+            colored_mask: Colored annotation mask
+            title: Title text to add
+            
+        Returns:
+            visualization: Image with overlay and title
+        """
+        h, w = base_image.shape[:2]
+        
+        # Prepare base image for overlay
+        if len(base_image.shape) == 3 and base_image.shape[2] == 3:
+            # Color image (camera)
+            overlay_base = base_image.copy()
+        else:
+            # LiDAR image - normalize for visualization
+            if len(base_image.shape) == 3:
+                base_channel = base_image[:, :, 0].astype(float)
+            else:
+                base_channel = base_image.astype(float)
+            
+            base_channel = (base_channel - base_channel.min()) / (base_channel.max() - base_channel.min() + 1e-6)
+            base_channel = (base_channel * 255).astype(np.uint8)
+            overlay_base = cv2.cvtColor(base_channel, cv2.COLOR_GRAY2RGB)
+        
+        # Overlay mask with transparency
+        alpha = 0.6
+        overlay = overlay_base.copy()
+        
+        # Apply mask only where there are annotations
+        mask_pixels = np.any(colored_mask > 0, axis=2)
+        overlay[mask_pixels] = cv2.addWeighted(
+            overlay_base[mask_pixels], 1-alpha, 
+            colored_mask[mask_pixels], alpha, 0
+        )
+        
+        # Add title if provided
+        if title:
+            # Add black background for text
+            cv2.rectangle(overlay, (0, 0), (w, 30), (0, 0, 0), -1)
+            cv2.putText(overlay, title, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 
+                       0.6, (255, 255, 255), 1, cv2.LINE_AA)
+        
+        return overlay
 
     def create_lidar_png_annotation(self, frame_id):
         """Create LiDAR-only annotation for a frame using enhanced lidar_png"""
@@ -260,51 +449,127 @@ class LiDARPNGAnnotationGenerator:
             # Load enhanced LiDAR geometric projection
             enhanced_lidar_img = self.load_enhanced_lidar_png(frame_id)
             if enhanced_lidar_img is None:
-                print(f"  ⚠️  No enhanced lidar_png for {frame_id}")
+                # print(f"  ⚠️  No enhanced lidar_png for {frame_id}")
                 return None
 
             # Load SAM annotation for object locations
             sam_annotation = self.load_sam_annotation(frame_id)
             if sam_annotation is None:
-                print(f"  ⚠️  No SAM annotation for {frame_id}")
+                # print(f"  ⚠️  No SAM annotation for {frame_id}")
                 return None
 
             # Create LiDAR-native annotation using enhanced lidar_png and SAM guidance
             annotation = self.create_lidar_native_annotation(enhanced_lidar_img, sam_annotation)
 
             # Dilate object regions for better supervision with enhanced data
-            annotation = self.dilate_object_regions(annotation)
+            annotation = self.dilate_object_regions(annotation, enhanced_lidar_img)
 
             return annotation
 
         except Exception as e:
-            print(f"  ❌ Error creating LiDAR annotation for {frame_id}: {e}")
+            # print(f"  ❌ Error creating LiDAR annotation for {frame_id}: {e}")
             return None
 
+    def process_single_frame(self, frame_id, create_vis=False, vis_dir=None, full_color_map=None):
+        """Process a single frame and return results for parallel processing
+        
+        Returns:
+            tuple: (frame_id, success, annotation, visualization_data)
+        """
+        try:
+            # Check if already exists
+            output_path = self.lidar_annotation_dir / f"frame_{frame_id}.png"
+            if output_path.exists():
+                return (frame_id, "skip", None, None)
+
+            # Create LiDAR annotation
+            annotation = self.create_lidar_png_annotation(frame_id)
+            
+            if annotation is None:
+                return (frame_id, "error", None, None)
+
+            # Save annotation
+            cv2.imwrite(str(output_path), annotation)
+
+            # Create visualization data if requested
+            vis_data = None
+            if create_vis and vis_dir and full_color_map:
+                try:
+                    # Load images for comparison
+                    lidar_img = self.load_enhanced_lidar_png(frame_id)
+                    camera_img = self.load_camera_image(frame_id)
+                    
+                    if lidar_img is not None:
+                        # Create colored mask for overlay
+                        colored_mask = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
+                        for class_id, color in full_color_map.items():
+                            if class_id == 0:  # Skip background for overlay
+                                continue
+                            colored_mask[annotation == class_id] = color
+                        
+                        # Create stacked visualization: LiDAR top, Camera bottom
+                        h, w = annotation.shape
+                        
+                        # Top half: LiDAR annotation on LiDAR PNG
+                        lidar_overlay = self.create_overlay_visualization(lidar_img, colored_mask, "LiDAR + Annotations")
+                        
+                        # Bottom half: LiDAR annotation on Camera image (if available)
+                        if camera_img is not None:
+                            # Resize camera image to match annotation dimensions if needed
+                            if camera_img.shape[:2] != (h, w):
+                                camera_img = cv2.resize(camera_img, (w, h), interpolation=cv2.INTER_LINEAR)
+                            
+                            camera_overlay = self.create_overlay_visualization(camera_img, colored_mask, "Camera + LiDAR Annotations")
+                            
+                            # Stack vertically: LiDAR on top, Camera on bottom
+                            vis_data = np.vstack([lidar_overlay, camera_overlay])
+                        else:
+                            # Fallback: Just LiDAR overlay if no camera available
+                            vis_data = lidar_overlay
+                    else:
+                        # Fallback to colored mask only
+                        colored_annotation = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
+                        for class_id, color in full_color_map.items():
+                            colored_annotation[annotation == class_id] = color
+                        vis_data = colored_annotation
+                        
+                except Exception as e:
+                    vis_data = None
+
+            return (frame_id, "success", annotation, vis_data)
+            
+        except Exception as e:
+            return (frame_id, "error", None, None)
+
     def process_all_frames(self, create_vis=False):
-        """Process all frames and create LiDAR annotations
+        """Process all frames and create LiDAR annotations using parallel processing
 
         Args:
             create_vis: Whether to create visualizations
         """
+        start_time = time.time()
+        
         print(f"\n🎯 Generating LiDAR-only annotations from enhanced lidar_png")
         print(f"Input: {self.lidar_png_dir} (enhanced)")
         print(f"SAM guidance: {self.sam_annotation_dir}")
         print(f"Output: {self.lidar_annotation_dir}")
         print(f"Frames to process: {len(self.frame_ids):,}")
+        print(f"Using {self.max_workers} parallel workers")
 
         success_count = 0
         error_count = 0
         skip_count = 0
         vis_count = 0
 
-        # Prepare visualization directory if needed
+        # Prepare visualization directory and color map if needed
+        vis_dir = None
+        full_color_map = None
         if create_vis:
             vis_dir = self.output_root / "visualizations" / "lidar_only_annotation"
             vis_dir.mkdir(parents=True, exist_ok=True)
 
             # Color map for visualization (consistent with SAM)
-            color_map = {
+            full_color_map = {
                 0: np.array([0, 0, 0], dtype=np.uint8),          # Background - Black
                 1: np.array([128, 128, 128], dtype=np.uint8),    # Ignore - Gray
                 2: np.array([255, 0, 0], dtype=np.uint8),        # Vehicle - Red
@@ -313,56 +578,66 @@ class LiDARPNGAnnotationGenerator:
                 5: np.array([0, 255, 0], dtype=np.uint8),        # Pedestrian - Green
             }
 
-        for frame_id in tqdm(self.frame_ids, desc="Processing frames"):
-            # Check if already exists
-            output_path = self.lidar_annotation_dir / f"frame_{frame_id}.png"
-
-            if output_path.exists():
-                skip_count += 1
-                continue
-
-            # Create LiDAR annotation
-            annotation = self.create_lidar_png_annotation(frame_id)
-
-            if annotation is None:
-                error_count += 1
-                continue
-
-            # Save annotation
-            cv2.imwrite(str(output_path), annotation)
-            success_count += 1
-
-            # Mark frame as processed
-            self.processed_frames.add(frame_id)
-            with open(self.processed_frames_file, 'a') as f:
-                f.write(f"{frame_id}\n")
-
-            # Create visualization if requested
-            if create_vis:
-                try:
-                    # Create colored visualization showing all classes
-                    # Background (0) = Black, Ignore (1) = Gray, Objects (2-5) = Colors
-                    colored_annotation = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
+        # Process frames in batches to manage memory
+        frame_batches = [self.frame_ids[i:i + self.batch_size] 
+                        for i in range(0, len(self.frame_ids), self.batch_size)]
+        
+        with tqdm(total=len(self.frame_ids), desc="Processing frames") as pbar:
+            for batch in frame_batches:
+                # Process batch in parallel
+                with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+                    # Create partial function with fixed parameters
+                    process_func = partial(self.process_single_frame, 
+                                         create_vis=create_vis, 
+                                         vis_dir=vis_dir, 
+                                         full_color_map=full_color_map)
                     
-                    # Color map for all classes (BGR format for OpenCV)
-                    full_color_map = {
-                        0: np.array([0, 0, 0], dtype=np.uint8),          # Background - Black
-                        1: np.array([128, 128, 128], dtype=np.uint8),    # Ignore - Gray
-                        2: np.array([0, 0, 255], dtype=np.uint8),        # Vehicle - Red (BGR)
-                        3: np.array([0, 255, 255], dtype=np.uint8),      # Sign - Yellow (BGR)
-                        4: np.array([255, 0, 255], dtype=np.uint8),      # Cyclist - Magenta (BGR)
-                        5: np.array([0, 255, 0], dtype=np.uint8),        # Pedestrian - Green (BGR)
-                    }
+                    # Submit all frames in batch
+                    futures = [executor.submit(process_func, frame_id) for frame_id in batch]
                     
-                    for class_id, color in full_color_map.items():
-                        mask = annotation == class_id
-                        colored_annotation[mask] = color
+                    # Process results as they complete
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            frame_id, status, annotation, vis_data = future.result()
+                            
+                            if status == "skip":
+                                skip_count += 1
+                            elif status == "error":
+                                error_count += 1
+                            elif status == "success":
+                                success_count += 1
+                                
+                                # Mark frame as processed
+                                self.processed_frames.add(frame_id)
+                                with open(self.processed_frames_file, 'a') as f:
+                                    f.write(f"{frame_id}\n")
+                                
+                                # Save visualization if available
+                                if vis_data is not None and vis_dir:
+                                    vis_path = vis_dir / f"frame_{frame_id}.png"
+                                    cv2.imwrite(str(vis_path), vis_data)
+                                    vis_count += 1
+                            
+                        except Exception as e:
+                            error_count += 1
+                            print(f"  ❌ Error processing frame result: {e}")
+                        
+                        pbar.update(1)
 
-                    vis_path = vis_dir / f"frame_{frame_id}.png"
-                    cv2.imwrite(str(vis_path), colored_annotation)
-                    vis_count += 1
-                except Exception as e:
-                    pass  # Skip visualization errors
+        # Calculate and display performance metrics
+        end_time = time.time()
+        total_time = end_time - start_time
+        processed_frames = success_count + error_count
+        
+        if processed_frames > 0:
+            time_per_frame = total_time / processed_frames
+            frames_per_second = processed_frames / total_time
+            
+            print(f"\n⏱️  Performance Metrics:")
+            print(f"   Total time: {total_time:.1f}s ({total_time/60:.1f}min)")
+            print(f"   Time per frame: {time_per_frame:.3f}s")
+            print(f"   Processing rate: {frames_per_second:.2f} frames/sec")
+            print(f"   Parallel efficiency: {self.max_workers} workers")
 
         print(f"\n{'='*60}")
         print(f"LIDAR PNG ANNOTATIONS COMPLETE")
@@ -376,17 +651,20 @@ class LiDARPNGAnnotationGenerator:
         print(f"\n🎯 LiDAR-Only Training Annotations:")
         print(f"   📥 Input: Enhanced lidar_png + SAM guidance")
         print(f"   🎨 Classes: Background(0), Ignore(1), Vehicle(2), Sign(3), Cyclist(4), Pedestrian(5)")
-        print(f"   🔧 Features:")
-        print(f"      - Dynamic vertical ignore (adapts to object positions)")
-        print(f"      - Sparse LiDAR detection (< 30% density)")
-        print(f"      - Distance-based ignore (>60m)")
-        print(f"      - Object dilation for better supervision")
-        print(f"      - Edge rows cleared (prevents dilation artifacts)")
+        print(f"   🔧 LiDAR-Aligned Strategy:")
+        print(f"      - Annotations align with enhanced LiDAR PNG coverage")
+        print(f"      - Accepts smoothed/interpolated regions from enhanced PNG")
+        print(f"      - Uses permissive coverage detection (any channel > 5)")
+        print(f"      - Conservative distance limits (max 80m coverage, 70m ignore)")
+        print(f"      - Prevents SAM masks from appearing in LiDAR-free areas")
         print(f"   📊 Background vs Ignore:")
         print(f"      - Background (0): No LiDAR coverage (black in viz)")
         print(f"      - Ignore (1): Edges beyond objects, sparse/distant LiDAR (gray in viz)")
         print(f"   ✓ Consistent with camera-only ignore strategy")
-        print(f"   📊 Visualization: All classes visible")
+        print(f"   📊 Visualization: Stacked comparison view")
+        print(f"      - Top: LiDAR PNG with annotation overlay")
+        print(f"      - Bottom: Camera image with LiDAR annotation overlay")
+        print(f"      - Verify geometric alignment between LiDAR and camera views")
         print(f"      - Black = Background, Gray = Ignore, Colors = Objects")
         print(f"   🎯 Purpose: LiDAR-native annotations for LiDAR-only model training")
 
@@ -397,6 +675,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Creates LiDAR-native segmentation annotations for LiDAR-only model training.
+
+PERFORMANCE OPTIMIZATIONS:
+- Parallel processing using multiple CPU cores
+- Efficient density calculation using sliding window instead of Gaussian filter
+- Batch processing to manage memory usage
+- Vectorized operations for faster computation
 
 REQUIRES: Run generate_sam.py and generate_lidar_png.py (enhanced) first!
 
@@ -416,17 +700,22 @@ Class mapping:
   5: Pedestrian (LiDAR points within SAM pedestrian regions)
 
 Usage examples:
-  # Generate annotations for all frames with both inputs available
+  # Generate annotations for all frames with both inputs available (optimized)
   python generate_lidar_png_annotation.py
 
-  # Generate with visualizations for all processed frames
+  # Generate with stacked visualizations comparing LiDAR vs camera alignment
   python generate_lidar_png_annotation.py --visualize
+
+  # Use custom number of workers
+  python generate_lidar_png_annotation.py --workers 4 --visualize
         """
     )
     parser.add_argument('--visualize', action='store_true',
-                       help='Create PNG visualizations showing LiDAR-detected objects for all processed frames')
+                       help='Create stacked PNG visualizations comparing LiDAR and camera views with annotation overlays')
     parser.add_argument('--dilation', type=int, default=3,
                        help='Dilation iterations for object regions (default: 3)')
+    parser.add_argument('--workers', type=int, default=None,
+                       help='Number of parallel workers (default: auto-detect, max 8)')
 
     args = parser.parse_args()
 
@@ -434,7 +723,7 @@ Usage examples:
     OUTPUT_ROOT = Path("/media/tom/ml/zod_temp")
 
     print("="*60)
-    print("LiDAR PNG Annotation Generator")
+    print("LiDAR PNG Annotation Generator (Optimized)")
     print("="*60)
     print(f"Input: {OUTPUT_ROOT / 'lidar_png'} (enhanced)")
     print(f"SAM: {OUTPUT_ROOT / 'annotation_sam'}")
@@ -444,10 +733,14 @@ Usage examples:
         output_root=OUTPUT_ROOT
     )
 
-    # Override dilation if specified
+    # Override parameters if specified
     if hasattr(args, 'dilation') and args.dilation != 3:
         generator.dilation_iterations = args.dilation
         print(f"Using custom dilation: {args.dilation} iterations")
+    
+    if hasattr(args, 'workers') and args.workers:
+        generator.max_workers = min(args.workers, multiprocessing.cpu_count())
+        print(f"Using {generator.max_workers} workers")
 
     # Process all frames with optional visualization
     generator.process_all_frames(create_vis=args.visualize)

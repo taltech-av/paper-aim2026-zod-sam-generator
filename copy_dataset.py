@@ -11,6 +11,7 @@ Copies from:
 - annotation_fusion/ -> annotation_fusion/
 - camera/ -> camera/
 - lidar_png/ -> lidar_png/
+- splits/ -> splits/
 
 Usage: python copy_dataset.py
 """
@@ -31,7 +32,8 @@ SOURCE_DIRS = {
     "annotation_lidar_only": SOURCE_BASE / "annotation_lidar_only",
     "annotation_fusion": SOURCE_BASE / "annotation_fusion",
     "camera": SOURCE_BASE / "camera",
-    "lidar_png": SOURCE_BASE / "lidar_png"
+    "lidar_png": SOURCE_BASE / "lidar_png",
+    "splits": SOURCE_BASE / "splits"
 }
 
 def extract_frame_id(path_str):
@@ -42,11 +44,34 @@ def extract_frame_id(path_str):
     frame_id = filename.replace('frame_', '').replace('.png', '')
     return frame_id
 
+def copy_splits_directory(dry_run=False):
+    """Copy the entire splits directory"""
+    src_splits = SOURCE_BASE / "splits"
+    dest_splits = DEST_BASE / "splits"
+
+    if not src_splits.exists():
+        print(f"⚠️  Warning: Splits directory not found: {src_splits}")
+        return 0
+
+    if not dry_run:
+        # Copy entire directory
+        if dest_splits.exists():
+            shutil.rmtree(dest_splits)
+        shutil.copytree(src_splits, dest_splits)
+
+    # Count files in splits directory
+    split_files = list(src_splits.glob("*"))
+    return len(split_files)
+
 def copy_frame_files(frame_id, dry_run=False):
     """Copy all files for a given frame ID"""
     files_copied = 0
 
     for modality, source_dir in SOURCE_DIRS.items():
+        if modality == "splits":
+            # Skip splits directory - we'll copy it entirely later
+            continue
+
         # Source file
         src_file = source_dir / f"frame_{frame_id}.png"
 
@@ -100,12 +125,12 @@ def main():
         dest_dir.mkdir(parents=True, exist_ok=True)
         print(f"  ✅ {dest_dir}")
 
-    # Count total files to copy
-    total_files_expected = len(frame_ids) * len(SOURCE_DIRS)
-    print(f"\n📊 Total files to copy: {total_files_expected:,}")
+    # Count total files to copy (excluding splits directory from per-frame count)
+    total_png_files_expected = len(frame_ids) * (len(SOURCE_DIRS) - 1)  # -1 for splits
+    print(f"\n📊 Total PNG files to copy: {total_png_files_expected:,}")
 
-    # Copy files
-    print("\n🚀 Copying files...")
+    # Copy PNG files
+    print("\n🚀 Copying PNG files...")
     copied_files = 0
     missing_files = 0
 
@@ -113,17 +138,25 @@ def main():
         files_for_frame = copy_frame_files(frame_id)
         copied_files += files_for_frame
 
-        if files_for_frame < len(SOURCE_DIRS):
-            missing_files += (len(SOURCE_DIRS) - files_for_frame)
+        if files_for_frame < (len(SOURCE_DIRS) - 1):  # -1 for splits
+            missing_files += ((len(SOURCE_DIRS) - 1) - files_for_frame)
+
+    # Copy splits directory
+    print("\n📋 Copying splits directory...")
+    splits_files_copied = copy_splits_directory()
+    print(f"📊 Split files copied: {splits_files_copied}")
+
+    total_files_copied = copied_files + splits_files_copied
 
     # Summary
     print("\n✅ Copy complete!")
-    print(f"📊 Files copied: {copied_files:,}")
+    print(f"📊 PNG files copied: {copied_files:,}")
+    print(f"📊 Split files copied: {splits_files_copied:,}")
     print(f"📊 Files missing: {missing_files:,}")
-    print(f"📊 Expected total: {total_files_expected:,}")
+    print(f"📊 PNG files expected: {total_png_files_expected:,}")
 
     if missing_files > 0:
-        print(f"⚠️  {missing_files} files were missing from source directories")
+        print(f"⚠️  {missing_files} PNG files were missing from source directories")
 
     # Verify destination
     print("\n🔍 Verifying destination...")
@@ -131,18 +164,24 @@ def main():
     for modality in SOURCE_DIRS.keys():
         dest_dir = DEST_BASE / modality
         if dest_dir.exists():
-            files_in_dir = list(dest_dir.glob("*.png"))
+            if modality == "splits":
+                # Count all files in splits directory
+                files_in_dir = list(dest_dir.glob("*"))
+            else:
+                # Count PNG files for other directories
+                files_in_dir = list(dest_dir.glob("*.png"))
             dest_files += len(files_in_dir)
             print(f"  {modality}: {len(files_in_dir):,} files")
 
     print(f"\n📊 Total files in destination: {dest_files:,}")
 
-    if dest_files == copied_files:
+    if dest_files == total_files_copied:
         print("✅ All files copied successfully!")
     else:
-        print(f"⚠️  Mismatch: {dest_files} files found vs {copied_files} expected")
+        print(f"⚠️  Mismatch: {dest_files} files found vs {total_files_copied} expected")
 
     print(f"\n📁 Dataset ready at: {DEST_BASE}")
+    print(f"📊 Total files copied: {total_files_copied:,}")
     print("Ready for training! 🚀")
 
 if __name__ == "__main__":

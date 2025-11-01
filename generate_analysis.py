@@ -39,7 +39,6 @@ CAMERA_DIR = OUTPUT_DIR / "camera"
 LIDAR_PNG_DIR = OUTPUT_DIR / "lidar_png"
 CAMERA_ANNOTATION_DIR = OUTPUT_DIR / "annotation_camera_only"
 LIDAR_ANNOTATION_DIR = OUTPUT_DIR / "annotation_lidar_only"
-ANALYSIS_DIR = OUTPUT_DIR / "analysis"
 SPLITS_DIR = OUTPUT_DIR / "splits"
 VISUALIZATION_DIR = OUTPUT_DIR / "visualizations" / "selected_frames"
 DATASET_ROOT = Path("/media/tom/ml/zod-data")
@@ -203,7 +202,6 @@ Usage:
     print("=" * 60)
 
     # Create directories
-    ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
     SPLITS_DIR.mkdir(parents=True, exist_ok=True)
     VISUALIZATION_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -578,7 +576,7 @@ Usage:
     # Testing splits per condition
     for condition in CONDITIONS:
         if testing_frames[condition]:
-            test_file = SPLITS_DIR / f"{condition}_test.txt"
+            test_file = SPLITS_DIR / f"test_{condition}.txt"
             with open(test_file, 'w') as f:
                 for frame_id in sorted(testing_frames[condition]):
                     f.write(f"{format_path(frame_id)}\n")
@@ -586,15 +584,16 @@ Usage:
     # Visualization splits per condition
     for condition in CONDITIONS:
         if visualization_frames[condition]:
-            viz_file = SPLITS_DIR / f"{condition}_visualization.txt"
+            viz_file = SPLITS_DIR / f"visualization_{condition}.txt"
             with open(viz_file, 'w') as f:
                 for frame_id in sorted(visualization_frames[condition]):
                     f.write(f"{format_path(frame_id)}\n")
 
-    # All frames (train + validation + test)
+    # All frames (train + validation + test + visualization)
     all_selected_frames = training_frame_ids | validation_frame_ids
     for condition in CONDITIONS:
         all_selected_frames.update(testing_frames[condition])
+        all_selected_frames.update(visualization_frames[condition])
 
     all_file = SPLITS_DIR / "all.txt"
     with open(all_file, 'w') as f:
@@ -756,12 +755,11 @@ Usage:
         }
     }
 
-    analysis_file = ANALYSIS_DIR / "pixel_count_analysis.json"
+    analysis_file = SPLITS_DIR / "pixel_count_analysis.json"
     with open(analysis_file, 'w') as f:
         json.dump(analysis_report, f, indent=2)
 
     print("\n💾 Analysis complete!")
-    print(f"📁 Results saved to: {ANALYSIS_DIR}")
     print(f"📁 Split files saved to: {SPLITS_DIR}")
     print(f"📊 Total frames analyzed: {total_all_frames}")
     print(f"🎯 Training frames selected: {len(training_frame_ids)}")

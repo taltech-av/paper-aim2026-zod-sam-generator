@@ -76,58 +76,30 @@ class CameraOnlyAnnotationGenerator:
     def create_ignore_regions(self, sam_annotation, camera_img=None):
         """Create ignore regions (class 1) for camera-only training
 
-        Dynamic strategy based on object positions:
-        1. Find topmost and bottommost objects in scene
-        2. Mark areas BEYOND objects (with margin) as ignore
-        3. If no objects near edges, minimal ignore region
-        4. If objects at edges, larger ignore region to exclude them
-        5. Mark very small objects as ignore (noise)
+        MINIMAL ignore strategy for camera-only models:
+        1. Camera sensors provide clear, undistorted views
+        2. Only mark tiny edge strips (1% of height) as ignore for safety
+        3. Remove very small objects (< 25 pixels) that are likely noise
+        4. Keep all other areas as trainable background
         
         Purpose of classes:
         - Background (0): Empty areas, safe negative samples for training
-        - Ignore (1): Don't compute loss here - uncertain/distorted areas
+        - Ignore (1): Don't compute loss here - truly uncertain/distorted areas
         """
         ignore_mask = np.zeros_like(sam_annotation, dtype=bool)
 
         h, w = sam_annotation.shape
 
-        # Strategy 1: Dynamic edge strips based on object positions
-        # Find topmost and bottommost pixels with any object
-        has_any_object = np.isin(sam_annotation, [2, 3, 4, 5])  # Any object class
+        # Strategy 1: Minimal edge strips only (camera has clear view)
+        # Mark only 1% of top/bottom edges as ignore (much more conservative)
+        edge_fraction = 0.01  # Reduced from 0.1/0.02
+        edge_height = max(int(h * edge_fraction), 5)  # At least 5 pixels
         
-        if np.any(has_any_object):
-            # Find rows containing objects
-            rows_with_objects = np.any(has_any_object, axis=1)
-            object_rows = np.where(rows_with_objects)[0]
-            
-            if len(object_rows) > 0:
-                topmost_object = object_rows[0]
-                bottommost_object = object_rows[-1]
-                
-                # Add margin beyond objects (2% of height as safety margin)
-                margin = max(int(h * 0.02), 10)  # At least 10 pixels
-                
-                # Mark regions BEYOND objects as ignore
-                top_ignore_line = max(0, topmost_object - margin)
-                bottom_ignore_line = min(h, bottommost_object + margin)
-                
-                peripheral_mask = np.zeros_like(sam_annotation, dtype=bool)
-                peripheral_mask[:top_ignore_line, :] = True  # Above topmost object
-                peripheral_mask[bottom_ignore_line:, :] = True  # Below bottommost object
-            else:
-                # Fallback: minimal edges if detection fails
-                peripheral_mask = np.zeros_like(sam_annotation, dtype=bool)
-                peripheral_mask[:10, :] = True
-                peripheral_mask[-10:, :] = True
-        else:
-            # No objects in frame - mark larger edge strips as ignore (can't learn from this)
-            edge_fraction = 0.1
-            edge_height = int(h * edge_fraction)
-            peripheral_mask = np.zeros_like(sam_annotation, dtype=bool)
-            peripheral_mask[:edge_height, :] = True
-            peripheral_mask[-edge_height:, :] = True
+        peripheral_mask = np.zeros_like(sam_annotation, dtype=bool)
+        peripheral_mask[:edge_height, :] = True  # Top 1%
+        peripheral_mask[-edge_height:, :] = True  # Bottom 1%
 
-        # Strategy 2: Mark ENTIRE objects that touch edge strips OR are very small
+        # Strategy 2: Mark very small objects as ignore (noise reduction)
         objects_to_ignore_mask = np.zeros_like(sam_annotation, dtype=bool)
         
         for class_id in [2, 3, 4, 5]:  # object classes
@@ -142,17 +114,14 @@ class CameraOnlyAnnotationGenerator:
                     object_region = (labels == label_id)
                     area = stats[label_id, cv2.CC_STAT_AREA]
                     
-                    # Check if this object touches edge strips
-                    touches_edge = np.any(object_region & peripheral_mask)
+                    # More aggressive small object removal (reduced threshold)
+                    is_too_small = area < 25  # Reduced from 50
                     
-                    # Check if object is very small (< 50 pixels, likely noise)
-                    is_too_small = area < 50
-                    
-                    # Mark entire object for ignore if it touches edges or is too small
-                    if touches_edge or is_too_small:
+                    # Mark entire object for ignore if too small
+                    if is_too_small:
                         objects_to_ignore_mask |= object_region
 
-        # Combine: edge strips (background only) + entire objects that touch edges/too small
+        # Combine: minimal edge strips + tiny noise objects
         ignore_mask = peripheral_mask | objects_to_ignore_mask
 
         return ignore_mask
@@ -204,12 +173,12 @@ class CameraOnlyAnnotationGenerator:
             vis_dir = self.output_root / "visualizations" / "camera_only_annotation"
             vis_dir.mkdir(parents=True, exist_ok=True)
 
-            # Color map for visualization
+            # Color map for visualization (BGR format for OpenCV) - used for overlay
             color_map = {
-                0: np.array([0, 0, 0], dtype=np.uint8),          # Background - Black
+                0: np.array([0, 0, 0], dtype=np.uint8),          # Background - Transparent in overlay
                 1: np.array([128, 128, 128], dtype=np.uint8),    # Ignore - Gray
-                2: np.array([255, 0, 0], dtype=np.uint8),        # Vehicle - Red
-                3: np.array([255, 255, 0], dtype=np.uint8),      # Sign - Yellow
+                2: np.array([0, 0, 255], dtype=np.uint8),        # Vehicle - Red
+                3: np.array([0, 255, 255], dtype=np.uint8),      # Sign - Yellow
                 4: np.array([255, 0, 255], dtype=np.uint8),      # Cyclist - Magenta
                 5: np.array([0, 255, 0], dtype=np.uint8),        # Pedestrian - Green
             }
@@ -241,13 +210,37 @@ class CameraOnlyAnnotationGenerator:
             # Create visualization if requested
             if create_vis:
                 try:
-                    # Create colored visualization
-                    colored_annotation = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
-                    for class_id, color in color_map.items():
-                        colored_annotation[annotation == class_id] = color
-
-                    vis_path = vis_dir / f"frame_{frame_id}.png"
-                    cv2.imwrite(str(vis_path), colored_annotation)
+                    # Load original camera image
+                    camera_img = self.load_camera_image(frame_id)
+                    if camera_img is None:
+                        # Fallback to colored mask only if camera image not found
+                        colored_annotation = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
+                        for class_id, color in color_map.items():
+                            colored_annotation[annotation == class_id] = color
+                        vis_path = vis_dir / f"frame_{frame_id}.png"
+                        cv2.imwrite(str(vis_path), colored_annotation)
+                    else:
+                        # Create colored mask
+                        colored_mask = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
+                        for class_id, color in color_map.items():
+                            if class_id == 0:  # Skip background for overlay
+                                continue
+                            colored_mask[annotation == class_id] = color
+                        
+                        # Overlay mask on camera image with transparency
+                        alpha = 0.6  # Transparency level for mask
+                        overlay = camera_img.copy()
+                        
+                        # Apply mask only where there are annotations (non-background)
+                        mask_pixels = (annotation > 0)
+                        overlay[mask_pixels] = cv2.addWeighted(
+                            camera_img[mask_pixels], 1-alpha, 
+                            colored_mask[mask_pixels], alpha, 0
+                        )
+                        
+                        vis_path = vis_dir / f"frame_{frame_id}.png"
+                        cv2.imwrite(str(vis_path), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+                    
                     vis_count += 1
                 except Exception as e:
                     pass  # Skip visualization errors
@@ -264,12 +257,11 @@ class CameraOnlyAnnotationGenerator:
         print(f"\n🎯 Camera-Only Training Annotations:")
         print(f"   📥 Input: SAM annotations")
         print(f"   🎨 Classes: Background(0), Ignore(1), Vehicle(2), Sign(3), Cyclist(4), Pedestrian(5)")
-        print(f"   🔧 Dynamic Ignore Strategy:")
-        print(f"      - Adapts to object positions in each frame")
-        print(f"      - Marks areas BEYOND objects (±2% margin)")
-        print(f"      - Objects touching edges → included with margin")
-        print(f"      - No objects → larger edge ignore zones")
-        print(f"      - Very small objects (< 50 pixels) → ignore")
+        print(f"   🔧 Minimal Ignore Strategy for Camera:")
+        print(f"      - Camera provides clear, undistorted views")
+        print(f"      - Only 1% top/bottom edges marked as ignore")
+        print(f"      - Very small objects (< 25 pixels) removed as noise")
+        print(f"      - Maximize trainable background areas")
         print(f"   ✓ Full horizontal width preserved")
         print(f"   ✓ Minimal ignore regions per frame")
         print(f"   📊 Class Purpose:")
@@ -289,14 +281,13 @@ REQUIRES: Run generate_sam.py first!
 
 Strategy:
 1. Start with SAM annotations (camera-based object segmentation)
-2. **DYNAMIC** ignore regions based on object positions:
-   - Find topmost and bottommost objects in each frame
-   - Mark areas BEYOND objects (with 2% margin) as ignore
-   - Adapts per frame: objects at edges → minimal ignore, no objects → larger ignore
-   - Entire objects touching dynamic edge zones are marked ignore
-   - Very small isolated objects (< 50 pixels, noise) marked ignore
-3. Preserve full horizontal width (no side borders)
-4. Maximize usable training area per frame
+2. **MINIMAL** ignore regions for camera-only training:
+   - Camera sensors provide clear, undistorted views
+   - Mark only 1% of top/bottom edges as ignore (safety margin)
+   - Remove very small objects (< 25 pixels) that are likely noise
+   - Keep 98%+ of image as trainable background
+3. Preserve full horizontal width
+4. Maximize training data for optimal camera-only performance
 
 **Why Background vs Ignore?**
   Background (0): Definite negative samples - model learns "not an object"
@@ -316,12 +307,12 @@ Usage examples:
   # Generate camera-only annotations
   python generate_camera_only_annotation.py
 
-  # Generate with visualizations
+  # Generate with visualizations (masks overlaid on camera images)
   python generate_camera_only_annotation.py --visualize
         """
     )
     parser.add_argument('--visualize', action='store_true',
-                       help='Create PNG visualizations for all processed frames')
+                       help='Create PNG visualizations overlaying masks on original camera images for visual verification')
 
     args = parser.parse_args()
 
