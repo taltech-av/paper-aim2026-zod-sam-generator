@@ -184,66 +184,66 @@ class CameraOnlyAnnotationGenerator:
             }
 
         for frame_id in tqdm(self.frame_ids, desc="Processing frames"):
-            # Check if already exists
             output_path = self.camera_annotation_dir / f"frame_{frame_id}.png"
 
+            # Check if annotation already exists
             if output_path.exists():
                 skip_count += 1
-                continue
+                annotation = cv2.imread(str(output_path), cv2.IMREAD_GRAYSCALE)
+            else:
+                # Create camera-only annotation
+                annotation = self.create_camera_only_annotation(frame_id)
 
-            # Create camera-only annotation
-            annotation = self.create_camera_only_annotation(frame_id)
+                if annotation is None:
+                    error_count += 1
+                    continue
 
-            if annotation is None:
-                error_count += 1
-                continue
+                # Save annotation
+                cv2.imwrite(str(output_path), annotation)
+                success_count += 1
 
-            # Save annotation
-            cv2.imwrite(str(output_path), annotation)
-            success_count += 1
+                # Mark frame as processed
+                self.processed_frames.add(frame_id)
+                with open(self.processed_frames_file, 'a') as f:
+                    f.write(f"{frame_id}\n")
 
-            # Mark frame as processed
-            self.processed_frames.add(frame_id)
-            with open(self.processed_frames_file, 'a') as f:
-                f.write(f"{frame_id}\n")
-
-            # Create visualization if requested
-            if create_vis:
-                try:
-                    # Load original camera image
-                    camera_img = self.load_camera_image(frame_id)
-                    if camera_img is None:
-                        # Fallback to colored mask only if camera image not found
-                        colored_annotation = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
-                        for class_id, color in color_map.items():
-                            colored_annotation[annotation == class_id] = color
-                        vis_path = vis_dir / f"frame_{frame_id}.png"
-                        cv2.imwrite(str(vis_path), colored_annotation)
-                    else:
-                        # Create colored mask
-                        colored_mask = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
-                        for class_id, color in color_map.items():
-                            if class_id == 0:  # Skip background for overlay
-                                continue
-                            colored_mask[annotation == class_id] = color
+            # Create visualization if requested and it doesn't exist
+            if create_vis and annotation is not None:
+                vis_path = vis_dir / f"frame_{frame_id}.png"
+                if not vis_path.exists():
+                    try:
+                        # Load original camera image
+                        camera_img = self.load_camera_image(frame_id)
+                        if camera_img is None:
+                            # Fallback to colored mask only if camera image not found
+                            colored_annotation = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
+                            for class_id, color in color_map.items():
+                                colored_annotation[annotation == class_id] = color
+                            cv2.imwrite(str(vis_path), colored_annotation)
+                        else:
+                            # Create colored mask
+                            colored_mask = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
+                            for class_id, color in color_map.items():
+                                if class_id == 0:  # Skip background for overlay
+                                    continue
+                                colored_mask[annotation == class_id] = color
+                            
+                            # Overlay mask on camera image with transparency
+                            alpha = 0.6  # Transparency level for mask
+                            overlay = camera_img.copy()
+                            
+                            # Apply mask only where there are annotations (non-background)
+                            mask_pixels = (annotation > 0)
+                            overlay[mask_pixels] = cv2.addWeighted(
+                                camera_img[mask_pixels], 1-alpha, 
+                                colored_mask[mask_pixels], alpha, 0
+                            )
+                            
+                            cv2.imwrite(str(vis_path), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
                         
-                        # Overlay mask on camera image with transparency
-                        alpha = 0.6  # Transparency level for mask
-                        overlay = camera_img.copy()
-                        
-                        # Apply mask only where there are annotations (non-background)
-                        mask_pixels = (annotation > 0)
-                        overlay[mask_pixels] = cv2.addWeighted(
-                            camera_img[mask_pixels], 1-alpha, 
-                            colored_mask[mask_pixels], alpha, 0
-                        )
-                        
-                        vis_path = vis_dir / f"frame_{frame_id}.png"
-                        cv2.imwrite(str(vis_path), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-                    
-                    vis_count += 1
-                except Exception as e:
-                    pass  # Skip visualization errors
+                        vis_count += 1
+                    except Exception as e:
+                        pass  # Skip visualization errors
 
         print(f"\n{'='*60}")
         print(f"CAMERA-ONLY ANNOTATIONS COMPLETE")

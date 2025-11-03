@@ -420,54 +420,64 @@ class FusionAnnotationGenerator:
             tuple: (frame_id, status, annotation, visualization_data)
         """
         try:
-            # Check if already exists
+            # Check if annotation already exists
             output_path = self.fusion_annotation_dir / f"frame_{frame_id}.png"
             if output_path.exists():
-                return (frame_id, "skip", None, None)
+                # Load existing annotation for potential visualization
+                annotation = cv2.imread(str(output_path), cv2.IMREAD_GRAYSCALE)
+                if annotation is None:
+                    return (frame_id, "error", None, None)
+            else:
+                # Create fusion annotation
+                annotation = self.create_fusion_annotation(frame_id)
+                
+                if annotation is None:
+                    return (frame_id, "error", None, None)
 
-            # Create fusion annotation
-            annotation = self.create_fusion_annotation(frame_id)
-            
-            if annotation is None:
-                return (frame_id, "error", None, None)
+                # Save annotation
+                cv2.imwrite(str(output_path), annotation)
 
-            # Save annotation
-            cv2.imwrite(str(output_path), annotation)
+                # Mark frame as processed
+                self.processed_frames.add(frame_id)
+                with open(self.processed_frames_file, 'a') as f:
+                    f.write(f"{frame_id}\n")
 
-            # Create visualization data if requested
+            # Create visualization data if requested and it doesn't exist
             vis_data = None
             if create_vis and vis_dir and color_map:
-                try:
-                    # Load camera image for visualization
-                    camera_img = self.load_camera_image(frame_id)
-                    
-                    # Create colored mask for overlay
-                    colored_mask = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
-                    for class_id, color in color_map.items():
-                        if class_id == 0:  # Skip background for overlay
-                            continue
-                        colored_mask[annotation == class_id] = color
-                    
-                    if camera_img is not None:
-                        # Resize camera image to match annotation dimensions if needed
-                        if camera_img.shape[:2] != annotation.shape:
-                            camera_img = cv2.resize(camera_img, (annotation.shape[1], annotation.shape[0]), interpolation=cv2.INTER_LINEAR)
+                vis_path = vis_dir / f"frame_{frame_id}.png"
+                if not vis_path.exists():
+                    try:
+                        # Load camera image for visualization
+                        camera_img = self.load_camera_image(frame_id)
                         
-                        # Create overlay visualization: Camera image with fusion annotations
-                        overlay = self.create_overlay_visualization(camera_img, colored_mask, "Fusion: Camera + LiDAR Annotations")
-                        vis_path = vis_dir / f"frame_{frame_id}.png"
-                        cv2.imwrite(str(vis_path), overlay)
-                        vis_data = overlay
-                    else:
-                        # Fallback to colored mask only if no camera available
-                        vis_path = vis_dir / f"frame_{frame_id}.png"
-                        cv2.imwrite(str(vis_path), colored_mask)
-                        vis_data = colored_mask
-                    
-                except Exception as e:
-                    vis_data = None
+                        # Create colored mask for overlay
+                        colored_mask = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
+                        for class_id, color in color_map.items():
+                            if class_id == 0:  # Skip background for overlay
+                                continue
+                            colored_mask[annotation == class_id] = color
+                        
+                        if camera_img is not None:
+                            # Resize camera image to match annotation dimensions if needed
+                            if camera_img.shape[:2] != annotation.shape:
+                                camera_img = cv2.resize(camera_img, (annotation.shape[1], annotation.shape[0]), interpolation=cv2.INTER_LINEAR)
+                            
+                            # Create overlay visualization: Camera image with fusion annotations
+                            overlay = self.create_overlay_visualization(camera_img, colored_mask, "Fusion: Camera + LiDAR Annotations")
+                            vis_data = overlay
+                        else:
+                            # Fallback to colored mask only if no camera available
+                            vis_data = colored_mask
+                            
+                    except Exception as e:
+                        vis_data = None
 
-            return (frame_id, "success", annotation, vis_data)
+            # Return appropriate status
+            if output_path.exists() and 'annotation' not in locals():
+                return (frame_id, "skip", annotation, vis_data)
+            else:
+                return (frame_id, "success", annotation, vis_data)
             
         except Exception as e:
             return (frame_id, "error", None, None)
@@ -539,12 +549,12 @@ class FusionAnnotationGenerator:
                                 self.processed_frames.add(frame_id)
                                 with open(self.processed_frames_file, 'a') as f:
                                     f.write(f"{frame_id}\n")
-                                
-                                # Save visualization if available
-                                if vis_data is not None and vis_dir:
-                                    vis_path = vis_dir / f"frame_{frame_id}.png"
-                                    cv2.imwrite(str(vis_path), vis_data)
-                                    vis_count += 1
+                            
+                            # Save visualization if available (for both existing and new annotations)
+                            if vis_data is not None and vis_dir:
+                                vis_path = vis_dir / f"frame_{frame_id}.png"
+                                cv2.imwrite(str(vis_path), vis_data)
+                                vis_count += 1
                             
                         except Exception as e:
                             error_count += 1

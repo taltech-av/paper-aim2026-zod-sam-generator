@@ -474,69 +474,83 @@ class LiDARPNGAnnotationGenerator:
         """Process a single frame and return results for parallel processing
         
         Returns:
-            tuple: (frame_id, success, annotation, visualization_data)
+            tuple: (frame_id, status, annotation, visualization_data)
         """
         try:
-            # Check if already exists
+            # Check if annotation already exists
             output_path = self.lidar_annotation_dir / f"frame_{frame_id}.png"
             if output_path.exists():
-                return (frame_id, "skip", None, None)
+                # Load existing annotation for potential visualization
+                annotation = cv2.imread(str(output_path), cv2.IMREAD_GRAYSCALE)
+                if annotation is None:
+                    return (frame_id, "error", None, None)
+            else:
+                # Create LiDAR annotation
+                annotation = self.create_lidar_png_annotation(frame_id)
+                
+                if annotation is None:
+                    return (frame_id, "error", None, None)
 
-            # Create LiDAR annotation
-            annotation = self.create_lidar_png_annotation(frame_id)
-            
-            if annotation is None:
-                return (frame_id, "error", None, None)
+                # Save annotation
+                cv2.imwrite(str(output_path), annotation)
 
-            # Save annotation
-            cv2.imwrite(str(output_path), annotation)
+                # Mark frame as processed
+                self.processed_frames.add(frame_id)
+                with open(self.processed_frames_file, 'a') as f:
+                    f.write(f"{frame_id}\n")
 
-            # Create visualization data if requested
+            # Create visualization data if requested and it doesn't exist
             vis_data = None
             if create_vis and vis_dir and full_color_map:
-                try:
-                    # Load images for comparison
-                    lidar_img = self.load_enhanced_lidar_png(frame_id)
-                    camera_img = self.load_camera_image(frame_id)
-                    
-                    if lidar_img is not None:
-                        # Create colored mask for overlay
-                        colored_mask = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
-                        for class_id, color in full_color_map.items():
-                            if class_id == 0:  # Skip background for overlay
-                                continue
-                            colored_mask[annotation == class_id] = color
+                vis_path = vis_dir / f"frame_{frame_id}.png"
+                if not vis_path.exists():
+                    try:
+                        # Load images for comparison
+                        lidar_img = self.load_enhanced_lidar_png(frame_id)
+                        camera_img = self.load_camera_image(frame_id)
                         
-                        # Create stacked visualization: LiDAR top, Camera bottom
-                        h, w = annotation.shape
-                        
-                        # Top half: LiDAR annotation on LiDAR PNG
-                        lidar_overlay = self.create_overlay_visualization(lidar_img, colored_mask, "LiDAR + Annotations")
-                        
-                        # Bottom half: LiDAR annotation on Camera image (if available)
-                        if camera_img is not None:
-                            # Resize camera image to match annotation dimensions if needed
-                            if camera_img.shape[:2] != (h, w):
-                                camera_img = cv2.resize(camera_img, (w, h), interpolation=cv2.INTER_LINEAR)
+                        if lidar_img is not None:
+                            # Create colored mask for overlay
+                            colored_mask = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
+                            for class_id, color in full_color_map.items():
+                                if class_id == 0:  # Skip background for overlay
+                                    continue
+                                colored_mask[annotation == class_id] = color
                             
-                            camera_overlay = self.create_overlay_visualization(camera_img, colored_mask, "Camera + LiDAR Annotations")
+                            # Create stacked visualization: LiDAR top, Camera bottom
+                            h, w = annotation.shape
                             
-                            # Stack vertically: LiDAR on top, Camera on bottom
-                            vis_data = np.vstack([lidar_overlay, camera_overlay])
+                            # Top half: LiDAR annotation on LiDAR PNG
+                            lidar_overlay = self.create_overlay_visualization(lidar_img, colored_mask, "LiDAR + Annotations")
+                            
+                            # Bottom half: LiDAR annotation on Camera image (if available)
+                            if camera_img is not None:
+                                # Resize camera image to match annotation dimensions if needed
+                                if camera_img.shape[:2] != (h, w):
+                                    camera_img = cv2.resize(camera_img, (w, h), interpolation=cv2.INTER_LINEAR)
+                                
+                                camera_overlay = self.create_overlay_visualization(camera_img, colored_mask, "Camera + LiDAR Annotations")
+                                
+                                # Stack vertically: LiDAR on top, Camera on bottom
+                                vis_data = np.vstack([lidar_overlay, camera_overlay])
+                            else:
+                                # Fallback: Just LiDAR overlay if no camera available
+                                vis_data = lidar_overlay
                         else:
-                            # Fallback: Just LiDAR overlay if no camera available
-                            vis_data = lidar_overlay
-                    else:
-                        # Fallback to colored mask only
-                        colored_annotation = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
-                        for class_id, color in full_color_map.items():
-                            colored_annotation[annotation == class_id] = color
-                        vis_data = colored_annotation
-                        
-                except Exception as e:
-                    vis_data = None
+                            # Fallback to colored mask only
+                            colored_annotation = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
+                            for class_id, color in full_color_map.items():
+                                colored_annotation[annotation == class_id] = color
+                            vis_data = colored_annotation
+                            
+                    except Exception as e:
+                        vis_data = None
 
-            return (frame_id, "success", annotation, vis_data)
+            # Return appropriate status
+            if output_path.exists() and 'annotation' not in locals():
+                return (frame_id, "skip", annotation, vis_data)
+            else:
+                return (frame_id, "success", annotation, vis_data)
             
         except Exception as e:
             return (frame_id, "error", None, None)
@@ -607,16 +621,16 @@ class LiDARPNGAnnotationGenerator:
                             elif status == "success":
                                 success_count += 1
                                 
-                                # Mark frame as processed
+                                # Mark frame as processed (only for newly created annotations)
                                 self.processed_frames.add(frame_id)
                                 with open(self.processed_frames_file, 'a') as f:
                                     f.write(f"{frame_id}\n")
-                                
-                                # Save visualization if available
-                                if vis_data is not None and vis_dir:
-                                    vis_path = vis_dir / f"frame_{frame_id}.png"
-                                    cv2.imwrite(str(vis_path), vis_data)
-                                    vis_count += 1
+                            
+                            # Save visualization if available (for both existing and new annotations)
+                            if vis_data is not None and vis_dir:
+                                vis_path = vis_dir / f"frame_{frame_id}.png"
+                                cv2.imwrite(str(vis_path), vis_data)
+                                vis_count += 1
                             
                         except Exception as e:
                             error_count += 1
