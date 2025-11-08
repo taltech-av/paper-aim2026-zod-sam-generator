@@ -3,6 +3,16 @@
 Generate Proper 3D-Geometric LiDAR Projections
 Creates 3-channel images where each channel contains normalized X, Y, Z coordinates
 CRITICAL: Preserves complete geometric information for fusion training
+
+COORDINATE SYSTEM ASSUMPTIONS:
+- camera_coordinates[:, 0] == 1 indicates front camera points
+- camera_coordinates[:, 1] = pixel X coordinate (0-3848)
+- camera_coordinates[:, 2] = pixel Y coordinate (0-2168)
+- 3d_points[:, 0] = X coordinate (left/right, meters)
+- 3d_points[:, 1] = Y coordinate (up/down, meters)  
+- 3d_points[:, 2] = Z coordinate (depth/distance, meters)
+
+These assumptions are dataset-specific and should be verified when using with new data.
 """
 
 import numpy as np
@@ -21,6 +31,13 @@ except ImportError:
         def decorator(func):
             return func
         return decorator
+
+try:
+    from scipy import ndimage
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    print("⚠️  Warning: scipy not available, gaussian filtering will use OpenCV fallback")
 
 @jit(nopython=True)
 def place_weighted_points_numba(x_valid, y_valid, x_norm, y_norm, z_norm, distance_weights, target_shape):
@@ -45,13 +62,39 @@ class GeometricLiDARProjector:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def load_lidar_data(self, frame_id):
-        """Load LiDAR pickle data"""
+        """Load LiDAR pickle data with validation"""
         pkl_path = self.input_dir / "lidar_pickle" / f"frame_{frame_id}.pkl"
         if not pkl_path.exists():
+            print(f"  ⚠️  LiDAR pickle file not found: {pkl_path}")
             return None
 
-        with open(pkl_path, 'rb') as f:
-            return pickle.load(f)
+        try:
+            with open(pkl_path, 'rb') as f:
+                data = pickle.load(f)
+            
+            # Validate data structure
+            required_keys = ['camera_coordinates', '3d_points']
+            missing_keys = [key for key in required_keys if key not in data]
+            if missing_keys:
+                print(f"  ❌ Invalid LiDAR data structure for {frame_id}: missing keys {missing_keys}")
+                return None
+            
+            # Validate data types and shapes
+            if not isinstance(data['camera_coordinates'], np.ndarray):
+                print(f"  ❌ camera_coordinates is not a numpy array for {frame_id}")
+                return None
+            if not isinstance(data['3d_points'], np.ndarray):
+                print(f"  ❌ 3d_points is not a numpy array for {frame_id}")
+                return None
+            if data['camera_coordinates'].shape[0] != data['3d_points'].shape[0]:
+                print(f"  ❌ Mismatched array lengths for {frame_id}: camera_coords {data['camera_coordinates'].shape[0]}, 3d_points {data['3d_points'].shape[0]}")
+                return None
+            
+            return data
+            
+        except Exception as e:
+            print(f"  ❌ Error loading LiDAR data for {frame_id}: {e}")
+            return None
 
     def create_geometric_projection(self, frame_id, target_shape=(768, 1363)):
         """
@@ -70,8 +113,18 @@ class GeometricLiDARProjector:
         # Get front camera coordinates and 3D points
         camera_coords = data['camera_coordinates']
         points_3d = data['3d_points']
+        
+        # Validate front camera assumption (camera_coords[:, 0] == 1)
         front_mask = camera_coords[:, 0] == 1
-
+        front_count = np.sum(front_mask)
+        total_count = len(camera_coords)
+        
+        if front_count == 0:
+            print(f"  ⚠️  No front camera points found for {frame_id} (all camera_coords[:, 0] != 1)")
+            return np.zeros((*target_shape, 3), dtype=np.uint8)
+        elif front_count < total_count * 0.1:  # Less than 10% front camera points
+            print(f"  ⚠️  Very few front camera points for {frame_id}: {front_count}/{total_count} ({front_count/total_count:.1%})")
+        
         front_coords = camera_coords[front_mask]
         front_points = points_3d[front_mask]
 
@@ -142,8 +195,18 @@ class GeometricLiDARProjector:
         # Get front camera coordinates and 3D points
         camera_coords = data['camera_coordinates']
         points_3d = data['3d_points']
+        
+        # Validate front camera assumption (camera_coords[:, 0] == 1)
         front_mask = camera_coords[:, 0] == 1
-
+        front_count = np.sum(front_mask)
+        total_count = len(camera_coords)
+        
+        if front_count == 0:
+            print(f"  ⚠️  No front camera points found for {frame_id} (all camera_coords[:, 0] != 1)")
+            return np.zeros((*target_shape, 3), dtype=np.uint8)
+        elif front_count < total_count * 0.1:  # Less than 10% front camera points
+            print(f"  ⚠️  Very few front camera points for {frame_id}: {front_count}/{total_count} ({front_count/total_count:.1%})")
+        
         front_coords = camera_coords[front_mask]
         front_points = points_3d[front_mask]
 
@@ -182,19 +245,19 @@ class GeometricLiDARProjector:
         # ===== ENHANCED NORMALIZATION =====
         # 1. Distance-based weighting: closer objects get higher intensity
         distance_weights = 1.0 / (z_3d + 1.0)  # Inverse distance weighting
-        distance_weights = np.clip(distance_weights * 2.0, 0.1, 2.0)  # Scale and clip
+        distance_weights = np.clip(distance_weights * 3.0, 0.2, 3.0)  # Scale and clip - INCREASED from 2.0
 
-        # 2. Improved normalization with better dynamic range
-        # X (left/right): Use smaller range for better precision near objects
-        x_norm = np.clip((x_3d + 20) / 40, 0, 1) * 255  # -20m to +20m range
+        # 2. Improved normalization with WIDER dynamic range for better precision
+        # X (left/right): Use wider range for better precision near objects
+        x_norm = np.clip((x_3d + 30) / 60, 0, 1) * 255  # -30m to +30m range - WIDER
 
-        # Y (up/down): Use smaller range for better precision
-        y_norm = np.clip((y_3d + 10) / 20, 0, 1) * 255  # -10m to +10m range
+        # Y (up/down): Use wider range for better precision
+        y_norm = np.clip((y_3d + 15) / 30, 0, 1) * 255  # -15m to +15m range - WIDER
 
-        # Z (depth): Emphasize closer distances with non-linear scaling
-        # Use logarithmic scaling to make close objects more distinct
+        # Z (depth): Emphasize closer distances with improved non-linear scaling
+        # Use better logarithmic scaling to make close objects more distinct
         z_log = np.log(z_3d + 1.0)  # Logarithmic distance
-        z_norm = np.clip(z_log / np.log(101.0), 0, 1) * 255  # 0-100m log-scaled
+        z_norm = np.clip(z_log / np.log(121.0), 0, 1) * 255  # 0-120m log-scaled - EXTENDED
 
         # Apply distance weighting to make closer objects more prominent
         x_norm = np.clip(x_norm * distance_weights, 0, 255)
@@ -203,8 +266,6 @@ class GeometricLiDARProjector:
 
         # ===== POINT DENSITY ENHANCEMENT (OPTIMIZED) =====
         # Create sparse arrays for each channel, then apply gaussian filtering
-        from scipy import ndimage
-        
         # Use JIT-compiled function for fast point placement
         if NUMBA_AVAILABLE:
             x_sparse, y_sparse, z_sparse = place_weighted_points_numba(
@@ -234,10 +295,14 @@ class GeometricLiDARProjector:
             geometric_proj[:, :, 1] = cv2.GaussianBlur(y_sparse, (kernel_size, kernel_size), sigma, borderType=cv2.BORDER_CONSTANT)
             geometric_proj[:, :, 2] = cv2.GaussianBlur(z_sparse, (kernel_size, kernel_size), sigma, borderType=cv2.BORDER_CONSTANT)
         except:
-            # Fallback to scipy if cv2 fails
-            geometric_proj[:, :, 0] = ndimage.gaussian_filter(x_sparse, sigma=sigma, mode='constant', cval=0)
-            geometric_proj[:, :, 1] = ndimage.gaussian_filter(y_sparse, sigma=sigma, mode='constant', cval=0)
-            geometric_proj[:, :, 2] = ndimage.gaussian_filter(z_sparse, sigma=sigma, mode='constant', cval=0)
+            # Fallback to scipy if cv2 fails and scipy is available
+            if SCIPY_AVAILABLE:
+                geometric_proj[:, :, 0] = ndimage.gaussian_filter(x_sparse, sigma=sigma, mode='constant', cval=0)
+                geometric_proj[:, :, 1] = ndimage.gaussian_filter(y_sparse, sigma=sigma, mode='constant', cval=0)
+                geometric_proj[:, :, 2] = ndimage.gaussian_filter(z_sparse, sigma=sigma, mode='constant', cval=0)
+            else:
+                print("  ❌ Neither OpenCV nor scipy gaussian filtering available!")
+                raise RuntimeError("Gaussian filtering not available - install scipy or check OpenCV")
 
         # ===== EFFICIENT DISTANCE-BASED GAP FILLING =====
         # Fill gaps using distance-based interpolation for smoother object boundaries
@@ -257,12 +322,12 @@ class GeometricLiDARProjector:
             dist_transform = cv2.distanceTransform(255 - mask * 255, cv2.DIST_L2, 5)
 
             # Identify gap pixels (close to objects but not part of them)
-            gap_mask = (dist_transform > 0) & (dist_transform <= 2.0) & (mask == 0)
+            gap_mask = (dist_transform > 0) & (dist_transform <= 3.0) & (mask == 0)  # INCREASED from 2.0
 
             if np.any(gap_mask):
                 # Efficient vectorized approach: use dilation with distance weighting
                 # Create a weighted dilation that considers distance
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))  # LARGER kernel
 
                 # Dilate the channel and mask
                 dilated_channel = cv2.dilate(channel.astype(np.float32), kernel, iterations=1)
@@ -270,26 +335,26 @@ class GeometricLiDARProjector:
 
                 # Create distance-weighted interpolation
                 # Closer original pixels contribute more
-                distance_weights = 1.0 / (dist_transform + 1.0)  # Avoid division by zero
-                distance_weights = np.clip(distance_weights, 0, 1)  # Normalize
+                distance_weights_interp = 1.0 / (dist_transform + 1.0)  # Avoid division by zero
+                distance_weights_interp = np.clip(distance_weights_interp, 0, 1)  # Normalize
 
                 # Combine original channel with dilated version using distance weighting
-                interpolated = channel * (1 - distance_weights * gap_mask) + dilated_channel * (distance_weights * gap_mask)
+                interpolated = channel * (1 - distance_weights_interp * gap_mask) + dilated_channel * (distance_weights_interp * gap_mask)
 
                 # Only fill gap regions
                 geometric_proj[:, :, c] = np.where(gap_mask, interpolated, geometric_proj[:, :, c])
 
         # ===== MORPHOLOGICAL DILATION =====
-        # Dilate object regions to provide more supervision signal for training
+        # Dilate object regions to provide MORE supervision signal for training
         # This expands the object boundaries to help with object detection
-        dilation_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))  # Larger kernel
+        dilation_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))  # LARGER kernel
         for c in range(3):
             # Create binary mask of non-zero pixels
             mask = (geometric_proj[:, :, c] > 0).astype(np.uint8)
-            # Dilate the mask with more iterations
-            dilated_mask = cv2.dilate(mask, dilation_kernel, iterations=2)  # More iterations
+            # Dilate the mask with MORE iterations
+            dilated_mask = cv2.dilate(mask, dilation_kernel, iterations=3)  # MORE iterations
             # Apply dilation by expanding non-zero regions
-            dilated_channel = cv2.dilate(geometric_proj[:, :, c], dilation_kernel, iterations=2)
+            dilated_channel = cv2.dilate(geometric_proj[:, :, c], dilation_kernel, iterations=3)
             # Only keep dilated values where mask was expanded
             geometric_proj[:, :, c] = np.where(dilated_mask > mask, dilated_channel, geometric_proj[:, :, c])
 
@@ -323,7 +388,12 @@ class GeometricLiDARProjector:
 
         # Check each channel
         channel_names = ['X (Blue)', 'Y (Green)', 'Z (Red)']
-        coord_ranges = [(-20, 20), (-10, 10), (0, 100)]  # Enhanced ranges
+
+        # Use correct ranges for each method
+        if use_enhanced:
+            coord_ranges = [(-30, 30), (-15, 15), (0, 120)]  # Enhanced ranges
+        else:
+            coord_ranges = [(-50, 50), (-50, 50), (0, 100)]  # Basic ranges
 
         for i, (name, coord_range) in enumerate(zip(channel_names, coord_ranges)):
             channel = geom_proj[:, :, i]
@@ -341,14 +411,14 @@ class GeometricLiDARProjector:
                 if use_enhanced:
                     print(f"  Enhanced: Distance-weighted with gaussian smoothing")
                 else:
-                    # Convert back to 3D coordinates to verify
+                    # Convert back to 3D coordinates to verify - use correct ranges
                     coord_values = (channel[channel > 0].astype(float) / 255)
-                    if i < 2:  # X, Y channels
-                        coord_3d = coord_values * 40 - 20  # Enhanced X range
-                        if i == 1:  # Y channel
-                            coord_3d = coord_values * 20 - 10  # Enhanced Y range
+                    if i == 0:  # X channel
+                        coord_3d = coord_values * 100 - 50  # Basic X range: -50m to +50m
+                    elif i == 1:  # Y channel
+                        coord_3d = coord_values * 100 - 50  # Basic Y range: -50m to +50m
                     else:  # Z channel
-                        coord_3d = coord_values * 100
+                        coord_3d = coord_values * 100  # Basic Z range: 0-100m
 
                     print(f"  Sample 3D values: {coord_3d[:5]}")
                     print(f"  3D range in data: {coord_3d.min():.1f}m - {coord_3d.max():.1f}m")
@@ -361,7 +431,7 @@ class GeometricLiDARProjector:
         print(f"  Total pixels: {total_pixels:,}")
         print(f"  Non-zero pixels: {nonzero_pixels:,}")
         print(f"  Sparsity: {sparsity:.2f}%")
-        
+
         if use_enhanced:
             print(f"  Enhancement: Distance weighting + gaussian smoothing applied")
 
@@ -371,6 +441,9 @@ class GeometricLiDARProjector:
         """Process all frames and create geometric projections"""
         method_name = "enhanced geometric" if use_enhanced else "basic geometric"
         print(f"🔄 Creating {method_name} LiDAR projections for {len(frame_list)} frames...")
+
+        success_count = 0
+        error_count = 0
 
         for frame_id in tqdm(frame_list):
             try:
@@ -383,21 +456,33 @@ class GeometricLiDARProjector:
                 if geom_proj is not None:
                     # Save geometric projection
                     output_path = self.output_dir / f"frame_{frame_id}.png"
-                    cv2.imwrite(str(output_path), geom_proj)
+                    success = cv2.imwrite(str(output_path), geom_proj)
+                    if success:
+                        success_count += 1
+                    else:
+                        print(f"  ❌ Failed to save projection for {frame_id}")
+                        error_count += 1
+                else:
+                    print(f"  ❌ Failed to create projection for {frame_id}")
+                    error_count += 1
 
             except Exception as e:
-                print(f"❌ Error processing {frame_id}: {e}")
+                print(f"  ❌ Error processing {frame_id}: {e}")
+                error_count += 1
                 continue
 
-        print("✅ Geometric LiDAR projections complete!")
+        print(f"✅ Geometric LiDAR projections complete!")
+        print(f"   ✓ Successfully processed: {success_count:,} frames")
+        if error_count > 0:
+            print(f"   ❌ Errors: {error_count:,} frames")
 
 def main():
     parser = argparse.ArgumentParser(description="Create geometric LiDAR projections")
-    parser.add_argument("--input_dir", default="/media/tom/ml/zod_temp", help="Input directory")
-    parser.add_argument("--output_dir", default="/media/tom/ml/zod_temp/lidar_png", help="Output directory")
+    parser.add_argument("--input_dir", default="/media/tom/ml/zod_temp", help="Input directory containing lidar_pickle folder")
+    parser.add_argument("--output_dir", default="/media/tom/ml/zod_temp/lidar_png", help="Output directory for LiDAR projections")
     parser.add_argument("--frames_file", help="Frames file to process (optional - if not provided, processes all frames from metadata)")
     parser.add_argument("--verify", action="store_true", help="Verify geometric content")
-    parser.add_argument("--enhanced", action="store_true", default=True, 
+    parser.add_argument("--enhanced", action="store_true", default=False,
                        help="Use enhanced projections with better channel weighting and gaussian smoothing (default: True)")
 
     args = parser.parse_args()

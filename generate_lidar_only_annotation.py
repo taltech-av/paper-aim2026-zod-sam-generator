@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Generate LiDAR-only annotations from enhanced lidar_png using SAM as ground truth.
+Generate LiDAR-only annotations from basic lidar_png using SAM as ground truth.
 
 This script creates LiDAR-native segmentation annotations for LiDAR-only model training by:
-1. Using enhanced lidar_png geometric projections for LiDAR coverage analysis
+1. Using basic lidar_png geometric projections for LiDAR coverage analysis
 2. Using SAM annotations as ground truth for object locations and types
 3. Mapping SAM-identified objects onto actual LiDAR points for LiDAR-native annotations
-4. Applying dilation to provide better supervision signal for sparse LiDAR data
+4. Maintaining exact geometric correspondence with LiDAR PNG coordinates (no dilation)
 
 Class mapping (LiDAR-native):
   0: Background (no LiDAR coverage)
@@ -31,7 +31,7 @@ import time
 
 
 class LiDARPNGAnnotationGenerator:
-    """Generate LiDAR-only annotations from enhanced lidar_png using SAM guidance"""
+    """Generate LiDAR-only annotations from lidar_png using SAM guidance"""
 
     def __init__(self, output_root):
         """Initialize LiDAR annotation generator
@@ -42,7 +42,7 @@ class LiDARPNGAnnotationGenerator:
         self.output_root = Path(output_root)
 
         # Input directories
-        self.lidar_png_dir = self.output_root / "lidar_png"  # Use enhanced version
+        self.lidar_png_dir = self.output_root / "lidar_png"  # Use basic version
         self.sam_annotation_dir = self.output_root / "annotation_sam"
         self.camera_dir = self.output_root / "camera"  # Add camera images for comparison
 
@@ -57,10 +57,10 @@ class LiDARPNGAnnotationGenerator:
             with open(self.processed_frames_file) as f:
                 self.processed_frames = set(line.strip() for line in f if line.strip())
 
-        # Find frames that have both enhanced lidar_png and SAM annotation
+        # Find frames that have both lidar_png and SAM annotation
         print("Scanning for available input files...")
         
-        # Get frame IDs from enhanced lidar_png files
+        # Get frame IDs from lidar_png files
         lidar_files = list(self.lidar_png_dir.glob("frame_*.png"))
         lidar_frame_ids = set()
         for lidar_file in lidar_files:
@@ -92,11 +92,9 @@ class LiDARPNGAnnotationGenerator:
         print(f"✓ Already processed: {len(self.processed_frames):,}")
         print(f"✓ Remaining to process: {len(self.frame_ids):,}")
 
-        # LiDAR annotation parameters
-        self.density_threshold = 0.15  # 15% density threshold for sparse regions (more permissive now)
-        self.distance_threshold = 70.0  # Points beyond 70m become ignore (conservative for training)
-        self.dilation_iterations = 3  # More dilation for enhanced lidar_png
-        self.adaptive_dilation = True  # Use adaptive dilation based on object characteristics
+        # LiDAR annotation parameters - RELAXED for better training data
+        self.density_threshold = 0.10  # REDUCED from 0.15 - More permissive for training
+        self.distance_threshold = 90.0  # INCREASED from 70.0 - Include more distant objects
         
         # Performance optimization parameters
         self.max_workers = min(multiprocessing.cpu_count(), 8)  # Limit to 8 workers max
@@ -121,13 +119,13 @@ class LiDARPNGAnnotationGenerator:
         
         return density_map
 
-    def load_enhanced_lidar_png(self, frame_id):
-        """Load enhanced LiDAR geometric projection"""
+    def load_lidar_png(self, frame_id):
+        """Load LiDAR geometric projection"""
         lidar_path = self.lidar_png_dir / f"frame_{frame_id}.png"
         if not lidar_path.exists():
             return None
 
-        # Load 3-channel enhanced geometric projection
+        # Load 3-channel geometric projection
         lidar_img = cv2.imread(str(lidar_path), cv2.IMREAD_UNCHANGED)
         return lidar_img
 
@@ -149,81 +147,81 @@ class LiDARPNGAnnotationGenerator:
         camera_img = cv2.imread(str(camera_path), cv2.IMREAD_COLOR)
         return camera_img
 
-    def create_lidar_native_annotation(self, enhanced_lidar_img, sam_annotation):
+    def create_lidar_native_annotation(self, lidar_img, sam_annotation):
         """Create LiDAR-native annotation using lidar_png and SAM guidance
 
         Strategy:
-        1. Use lidar_png for LiDAR coverage (permissive to match enhanced PNG content)
+        1. Use lidar_png for LiDAR coverage (permissive to match PNG content)
         2. Use SAM as ground truth for object locations and types
         3. Map SAM-identified objects onto LiDAR-covered regions
         4. Create LiDAR-native segmentation with proper class distinctions
 
         Args:
-            enhanced_lidar_img: 3-channel enhanced geometric projection
+            lidar_img: 3-channel geometric projection
             sam_annotation: SAM segmentation mask (ground truth)
 
         Returns:
             annotation: LiDAR-native segmentation mask
         """
-        if enhanced_lidar_img is None or sam_annotation is None:
+        if lidar_img is None or sam_annotation is None:
             return None
 
-        h, w, c = enhanced_lidar_img.shape
+        h, w, c = lidar_img.shape
 
         # Initialize annotation with background (0)
         annotation = np.zeros((h, w), dtype=np.uint8)
 
-        # Extract geometric information from enhanced lidar_png
-        x_channel = enhanced_lidar_img[:, :, 0].astype(float)  # X coordinates (normalized)
-        y_channel = enhanced_lidar_img[:, :, 1].astype(float)  # Y coordinates (normalized)
-        z_channel = enhanced_lidar_img[:, :, 2].astype(float)  # Z coordinates (depth, normalized)
+        # Extract geometric information from lidar_png
+        x_channel = lidar_img[:, :, 0].astype(float)  # X coordinates (normalized)
+        y_channel = lidar_img[:, :, 1].astype(float)  # Y coordinates (normalized)
+        z_channel = lidar_img[:, :, 2].astype(float)  # Z coordinates (depth, normalized)
 
-        # Create LiDAR coverage mask that aligns with enhanced LiDAR PNG
-        # The enhanced LiDAR PNG applies smoothing and dilation, so we should accept
+        # Create LiDAR coverage mask that aligns with LiDAR PNG
+        # The LiDAR PNG uses basic format with interpretable coordinates, so we should accept
         # regions where ANY channel has meaningful data (not require ALL channels)
         
-        # More permissive coverage: accept regions where LiDAR PNG has data
+        # MORE PERMISSIVE coverage: accept regions where LiDAR PNG has data
         # This ensures annotations align with actual LiDAR PNG content
-        lidar_coverage = np.any(enhanced_lidar_img > 5, axis=2)  # Any channel > 5 (permissive)
+        lidar_coverage = np.any(lidar_img > 3, axis=2)  # REDUCED threshold from 5
         
         # For stricter validation, also check that we don't have extremely distant points
-        # that are likely just smoothing artifacts - be more conservative for training
+        # that are likely just smoothing artifacts - LESS conservative for training
         z_channel_norm = z_channel / 255.0
-        distance_approx = np.exp(z_channel_norm * np.log(101.0))
-        reasonable_distance = distance_approx < 80.0  # Conservative: max 80m for training
+        distance_approx = z_channel_norm * 100.0  # Linear distance calculation
+        reasonable_distance = distance_approx < 100.0  # INCREASED from 80.0 - More permissive
         
         # Final coverage: has LiDAR data AND not extremely distant
         lidar_coverage = lidar_coverage & reasonable_distance
 
-        # Decode distance from enhanced normalization for density calculations
+        # Decode distance from normalization for density calculations
         z_norm = z_channel / 255.0
-        distance_map = np.exp(z_norm * np.log(101.0))
+        distance_map = z_norm * 100.0
 
         # 1. Background class (0): Areas with no LiDAR coverage
         # (already initialized to 0)
 
         # 2. Ignore class (1): Sparse LiDAR regions, distant points, AND edge regions
-        # Strategy A: Sparse/distant detection (quality-based ignore)
+        # Strategy A: Sparse/distant detection (quality-based ignore) - LESS aggressive
         # Create density map using efficient sliding window approach
         lidar_density = self.compute_density_map_efficient(lidar_coverage.astype(np.uint8))
 
-        # Areas with sparse LiDAR coverage (< 30% local density)
+        # Areas with sparse LiDAR coverage (< 25% local density) - INCREASED from 30%
         # BUT only where we actually have some LiDAR points
-        sparse_regions = (lidar_density < self.density_threshold) & lidar_coverage
+        sparse_regions = (lidar_density < 0.25) & lidar_coverage
 
-        # Areas beyond distance threshold (approximate)
+        # Areas beyond distance threshold (approximate) - INCREASED threshold
         distant_regions = (distance_map > self.distance_threshold) & lidar_coverage
 
         # Strategy B: Minimal vertical edge regions (conservative for LiDAR)
         # LiDAR covers the scene well, so use minimal edge strips
         vertical_edge_regions = np.zeros_like(sam_annotation, dtype=bool)
         
-        # Only mark tiny edge strips (1% of height) as ignore for safety
-        edge_fraction = 0.01  # Minimal edges
-        edge_height = max(int(h * edge_fraction), 5)  # At least 5 pixels
+        # Only mark tiny edge strips (0.5% of height) as ignore for safety - REDUCED from 1%
+        edge_fraction = 0.005  # REDUCED from 0.01
+        edge_height = max(int(h * edge_fraction), 3)  # At least 3 pixels - REDUCED from 5
         
-        vertical_edge_regions[:edge_height, :] = True  # Top 1%
-        vertical_edge_regions[-edge_height:, :] = True  # Bottom 1%
+        vertical_edge_regions[:edge_height, :] = True  # Top 0.5%
+        vertical_edge_regions[-edge_height:, :] = True  # Bottom 0.5%
         
         # Combine all ignore criteria
         ignore_regions = sparse_regions | distant_regions | vertical_edge_regions
@@ -233,10 +231,10 @@ class LiDARPNGAnnotationGenerator:
         # LiDAR-native approach: Only annotate where LiDAR points actually exist
         # This ensures training targets match available input data
         
-        # Quality thresholds for LiDAR-native object detection
-        min_density_for_object = 0.20  # 20% density minimum for objects
-        min_region_size = 8  # Minimum connected region size
-        max_distance_for_full_mask = 40.0  # Maximum distance for full SAM masks
+        # Quality thresholds for LiDAR-native object detection - RELAXED
+        min_density_for_object = 0.12  # REDUCED from 0.20 - More permissive
+        min_region_size = 5  # REDUCED from 8 - Allow smaller objects
+        max_distance_for_full_mask = 60.0  # INCREASED from 40.0 - Include more distant objects
         
         # For each SAM object class, only annotate LiDAR points that:
         # 1. Have sufficient local density
@@ -277,123 +275,6 @@ class LiDARPNGAnnotationGenerator:
         # Do NOT overwrite ignore regions that were set in step 2
 
         return annotation
-
-    def dilate_object_regions(self, annotation, enhanced_lidar_img):
-        """Dilate object regions with adaptive strategy for sparse LiDAR data
-        
-        Uses different dilation strategies based on object type and characteristics:
-        - Signs: More aggressive dilation (small objects, sparse points)
-        - Vehicles: Moderate dilation (larger objects)
-        - Distance-based: Closer objects get more dilation
-        """
-        if annotation is None or enhanced_lidar_img is None:
-            return None
-
-        if not self.adaptive_dilation:
-            # Fallback to simple dilation if adaptive is disabled
-            dilated = annotation.copy()
-            for class_id in [2, 3, 4, 5]:
-                obj_mask = (annotation == class_id)
-                if np.any(obj_mask):
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                    dilated_mask = cv2.dilate(obj_mask.astype(np.uint8), kernel, iterations=self.dilation_iterations)
-                    valid_expansion = dilated_mask & ((annotation == 0) | (annotation == 1))
-                    dilated[valid_expansion] = class_id
-            return dilated
-
-        dilated = annotation.copy()
-        h, w = annotation.shape
-
-        # Extract distance information for adaptive dilation
-        x_channel = enhanced_lidar_img[:, :, 0].astype(float)
-        y_channel = enhanced_lidar_img[:, :, 1].astype(float) 
-        z_channel = enhanced_lidar_img[:, :, 2].astype(float)
-        
-        z_norm = z_channel / 255.0
-        distance_map = np.exp(z_norm * np.log(101.0))
-
-        # Class-specific dilation parameters
-        dilation_params = {
-            2: {'kernel_size': 7, 'iterations': 4, 'name': 'Vehicle'},      # Vehicles - moderate
-            3: {'kernel_size': 9, 'iterations': 6, 'name': 'Sign'},         # Signs - aggressive (sparse!)
-            4: {'kernel_size': 5, 'iterations': 3, 'name': 'Cyclist'},     # Cyclists - minimal
-            5: {'kernel_size': 5, 'iterations': 3, 'name': 'Pedestrian'}   # Pedestrians - minimal
-        }
-
-        # Track dilation statistics
-        dilation_stats = {}
-
-        for class_id, params in dilation_params.items():
-            obj_mask = (annotation == class_id)
-            
-            if np.any(obj_mask):
-                # Calculate object characteristics for adaptive dilation
-                obj_pixels = np.sum(obj_mask)
-                
-                # Distance-based scaling: closer objects get more dilation
-                obj_distances = distance_map[obj_mask]
-                if len(obj_distances) > 0:
-                    median_distance = np.median(obj_distances)
-                    # Closer objects (lower distance) get more dilation
-                    distance_factor = max(0.5, 2.0 - median_distance / 50.0)  # 0.5x to 2.0x scaling
-                else:
-                    distance_factor = 1.0
-                
-                # Size-based scaling: smaller objects get more dilation
-                size_factor = 1.0
-                if obj_pixels < 10:  # Very small objects
-                    size_factor = 2.0
-                elif obj_pixels < 25:  # Small objects
-                    size_factor = 1.5
-                
-                # Apply adaptive scaling
-                adaptive_iterations = max(1, int(params['iterations'] * distance_factor * size_factor))
-                adaptive_kernel_size = max(3, int(params['kernel_size'] * size_factor))
-                
-                # Ensure odd kernel size
-                if adaptive_kernel_size % 2 == 0:
-                    adaptive_kernel_size += 1
-                
-                # Apply adaptive dilation
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (adaptive_kernel_size, adaptive_kernel_size))
-                dilated_mask = cv2.dilate(obj_mask.astype(np.uint8), kernel, iterations=adaptive_iterations)
-
-                # Only expand into background/ignore regions (don't overwrite other objects)
-                valid_expansion = dilated_mask & ((dilated == 0) | (dilated == 1))
-                dilated[valid_expansion] = class_id
-
-                # Track statistics
-                dilation_stats[class_id] = {
-                    'original_pixels': obj_pixels,
-                    'median_distance': median_distance if len(obj_distances) > 0 else 0,
-                    'distance_factor': distance_factor,
-                    'size_factor': size_factor,
-                    'final_iterations': adaptive_iterations,
-                    'final_kernel': adaptive_kernel_size,
-                    'expanded_pixels': np.sum(valid_expansion)
-                }
-
-        # Print dilation statistics (only for frames with objects, and not too frequently)
-        # if dilation_stats and np.random.random() < 0.01:  # 1% chance to print stats
-        #     print("  📊 Adaptive Dilation Stats:")
-        #     for class_id, stats in dilation_stats.items():
-        #         class_name = dilation_params[class_id]['name']
-        #         print(f"    {class_name}: {stats['original_pixels']}px → {stats['expanded_pixels']}px "
-        #               f"(dist:{stats['median_distance']:.1f}m, iter:{stats['final_iterations']}, k:{stats['final_kernel']})")
-
-        # Edge clearing (same as before)
-        edge_rows = max(self.dilation_iterations, 3) * 2 + 1
-        
-        has_objects_top = np.any(np.isin(dilated[edge_rows:edge_rows*2, :], [2, 3, 4, 5]))
-        has_objects_bottom = np.any(np.isin(dilated[-edge_rows*2:-edge_rows, :], [2, 3, 4, 5]))
-        
-        top_clear = 2 if has_objects_top else edge_rows
-        bottom_clear = 2 if has_objects_bottom else edge_rows
-        
-        dilated[:top_clear, :] = 0
-        dilated[-bottom_clear:, :] = 0
-
-        return dilated
 
     def create_overlay_visualization(self, base_image, colored_mask, title=""):
         """Create overlay visualization with title
@@ -444,12 +325,12 @@ class LiDARPNGAnnotationGenerator:
         return overlay
 
     def create_lidar_png_annotation(self, frame_id):
-        """Create LiDAR-only annotation for a frame using enhanced lidar_png"""
+        """Create LiDAR-only annotation for a frame using lidar_png"""
         try:
-            # Load enhanced LiDAR geometric projection
-            enhanced_lidar_img = self.load_enhanced_lidar_png(frame_id)
-            if enhanced_lidar_img is None:
-                # print(f"  ⚠️  No enhanced lidar_png for {frame_id}")
+            # Load LiDAR geometric projection
+            lidar_img = self.load_lidar_png(frame_id)
+            if lidar_img is None:
+                # print(f"  ⚠️  No lidar_png for {frame_id}")
                 return None
 
             # Load SAM annotation for object locations
@@ -458,11 +339,8 @@ class LiDARPNGAnnotationGenerator:
                 # print(f"  ⚠️  No SAM annotation for {frame_id}")
                 return None
 
-            # Create LiDAR-native annotation using enhanced lidar_png and SAM guidance
-            annotation = self.create_lidar_native_annotation(enhanced_lidar_img, sam_annotation)
-
-            # Dilate object regions for better supervision with enhanced data
-            annotation = self.dilate_object_regions(annotation, enhanced_lidar_img)
+            # Create LiDAR-native annotation using lidar_png and SAM guidance
+            annotation = self.create_lidar_native_annotation(lidar_img, sam_annotation)
 
             return annotation
 
@@ -506,7 +384,7 @@ class LiDARPNGAnnotationGenerator:
                 if not vis_path.exists():
                     try:
                         # Load images for comparison
-                        lidar_img = self.load_enhanced_lidar_png(frame_id)
+                        lidar_img = self.load_lidar_png(frame_id)
                         camera_img = self.load_camera_image(frame_id)
                         
                         if lidar_img is not None:
@@ -563,8 +441,8 @@ class LiDARPNGAnnotationGenerator:
         """
         start_time = time.time()
         
-        print(f"\n🎯 Generating LiDAR-only annotations from enhanced lidar_png")
-        print(f"Input: {self.lidar_png_dir} (enhanced)")
+        print(f"\n🎯 Generating LiDAR-only annotations from lidar_png")
+        print(f"Input: {self.lidar_png_dir}")
         print(f"SAM guidance: {self.sam_annotation_dir}")
         print(f"Output: {self.lidar_annotation_dir}")
         print(f"Frames to process: {len(self.frame_ids):,}")
@@ -663,13 +541,16 @@ class LiDARPNGAnnotationGenerator:
             print(f"📊 Visualizations created: {vis_count:,}")
         print(f"\n📁 Output: {self.lidar_annotation_dir}/")
         print(f"\n🎯 LiDAR-Only Training Annotations:")
-        print(f"   📥 Input: Enhanced lidar_png + SAM guidance")
+        print(f"   📥 Input: lidar_png + SAM guidance")
         print(f"   🎨 Classes: Background(0), Ignore(1), Vehicle(2), Sign(3), Cyclist(4), Pedestrian(5)")
-        print(f"   🔧 LiDAR-Aligned Strategy:")
-        print(f"      - Annotations align with enhanced LiDAR PNG coverage")
-        print(f"      - Accepts smoothed/interpolated regions from enhanced PNG")
-        print(f"      - Uses permissive coverage detection (any channel > 5)")
-        print(f"      - Conservative distance limits (max 80m coverage, 70m ignore)")
+        print(f"   🔧 LiDAR-Aligned Strategy (DISABLED DILATION for basic PNG compatibility):")
+        print(f"      - RELAXED density threshold: {self.density_threshold} (from 0.15)")
+        print(f"      - EXTENDED distance threshold: {self.distance_threshold}m (from 70.0m)")
+        print(f"      - MORE permissive coverage detection (>3 vs >5)")
+        print(f"      - REDUCED edge ignore regions (0.5% vs 1%)")
+        print(f"      - NO dilation applied - exact geometric correspondence")
+        print(f"      - Annotations align with LiDAR PNG coverage")
+        print(f"      - Accepts smoothed/interpolated regions from LiDAR PNG")
         print(f"      - Prevents SAM masks from appearing in LiDAR-free areas")
         print(f"   📊 Background vs Ignore:")
         print(f"      - Background (0): No LiDAR coverage (black in viz)")
@@ -685,7 +566,7 @@ class LiDARPNGAnnotationGenerator:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate LiDAR-only annotations from enhanced lidar_png using SAM guidance",
+        description="Generate LiDAR-only annotations from lidar_png using SAM guidance",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Creates LiDAR-native segmentation annotations for LiDAR-only model training.
@@ -696,14 +577,14 @@ PERFORMANCE OPTIMIZATIONS:
 - Batch processing to manage memory usage
 - Vectorized operations for faster computation
 
-REQUIRES: Run generate_sam.py and generate_lidar_png.py (enhanced) first!
+REQUIRES: Run generate_sam.py and generate_lidar_png.py first!
 
 Strategy:
-1. Automatically finds frames with both enhanced lidar_png and SAM annotations
-2. Uses enhanced lidar_png geometric projections for LiDAR coverage analysis
+1. Automatically finds frames with both lidar_png and SAM annotations
+2. Uses lidar_png geometric projections for LiDAR coverage analysis
 3. Uses SAM annotations as ground truth for object locations and types
 4. Maps SAM-identified objects onto actual LiDAR points for LiDAR-native annotations
-5. Applies dilation to provide better supervision signal
+5. Maintains exact geometric correspondence with LiDAR PNG coordinates (no dilation)
 
 Class mapping:
   0: Background (no LiDAR coverage)
@@ -726,8 +607,6 @@ Usage examples:
     )
     parser.add_argument('--visualize', action='store_true',
                        help='Create stacked PNG visualizations comparing LiDAR and camera views with annotation overlays')
-    parser.add_argument('--dilation', type=int, default=3,
-                       help='Dilation iterations for object regions (default: 3)')
     parser.add_argument('--workers', type=int, default=None,
                        help='Number of parallel workers (default: auto-detect, max 8)')
 
@@ -739,7 +618,7 @@ Usage examples:
     print("="*60)
     print("LiDAR PNG Annotation Generator (Optimized)")
     print("="*60)
-    print(f"Input: {OUTPUT_ROOT / 'lidar_png'} (enhanced)")
+    print(f"Input: {OUTPUT_ROOT / 'lidar_png'}")
     print(f"SAM: {OUTPUT_ROOT / 'annotation_sam'}")
     print(f"Output: {OUTPUT_ROOT / 'annotation_lidar_only'}")
 
@@ -748,10 +627,6 @@ Usage examples:
     )
 
     # Override parameters if specified
-    if hasattr(args, 'dilation') and args.dilation != 3:
-        generator.dilation_iterations = args.dilation
-        print(f"Using custom dilation: {args.dilation} iterations")
-    
     if hasattr(args, 'workers') and args.workers:
         generator.max_workers = min(args.workers, multiprocessing.cpu_count())
         print(f"Using {generator.max_workers} workers")

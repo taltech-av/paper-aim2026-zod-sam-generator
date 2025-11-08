@@ -25,14 +25,14 @@ import time
 class FusionAnnotationGenerator:
     """Generate fusion annotations combining camera and LiDAR data"""
 
-    def __init__(self, output_root, sam_dir='annotation_sam', lidar_dir='lidar_png_enhanced',
+    def __init__(self, output_root, sam_dir='annotation_sam', lidar_dir='lidar_png',
                  camera_dir='camera', fusion_dir='annotation_fusion'):
         """Initialize fusion annotation generator
 
         Args:
             output_root: Path to output root directory
             sam_dir: Directory name for SAM annotations (relative to output_root)
-            lidar_dir: Directory name for enhanced LiDAR PNGs (relative to output_root)
+            lidar_dir: Directory name for LiDAR PNGs (relative to output_root)
             camera_dir: Directory name for camera images (relative to output_root)
             fusion_dir: Directory name for fusion annotations output (relative to output_root)
         """
@@ -71,7 +71,7 @@ class FusionAnnotationGenerator:
         available_frame_ids = sam_frame_ids & lidar_frame_ids & camera_frame_ids
 
         print(f"✓ Found {len(sam_frame_ids):,} SAM annotation files")
-        print(f"✓ Found {len(lidar_frame_ids):,} enhanced lidar_png files")
+        print(f"✓ Found {len(lidar_frame_ids):,} lidar_png files")
         print(f"✓ Found {len(camera_frame_ids):,} camera image files")
         print(f"✓ Found {len(available_frame_ids):,} frames with all inputs")
 
@@ -89,7 +89,6 @@ class FusionAnnotationGenerator:
         # Fusion parameters
         self.lidar_confidence_threshold = 0.3  # Minimum LiDAR density for confident regions
         self.depth_consistency_threshold = 0.8  # Depth consistency check
-        self.fusion_dilation_iterations = 2  # Moderate dilation for fusion
 
         # Performance optimization parameters
         self.max_workers = min(multiprocessing.cpu_count(), 8)  # Limit to 8 workers max
@@ -102,8 +101,8 @@ class FusionAnnotationGenerator:
             return None
         return cv2.imread(str(sam_path), cv2.IMREAD_GRAYSCALE)
 
-    def load_enhanced_lidar_png(self, frame_id):
-        """Load enhanced LiDAR geometric projection"""
+    def load_lidar_png(self, frame_id):
+        """Load LiDAR geometric projection"""
         lidar_path = self.lidar_png_dir / f"frame_{frame_id}.png"
         if not lidar_path.exists():
             return None
@@ -116,16 +115,16 @@ class FusionAnnotationGenerator:
             return None
         return cv2.imread(str(camera_path), cv2.IMREAD_COLOR)
 
-    def create_fusion_confidence_mask(self, enhanced_lidar_img, sam_annotation):
+    def create_fusion_confidence_mask(self, lidar_img, sam_annotation):
         """Create confidence mask based on LiDAR-camera fusion analysis
 
         Returns:
             confidence_mask: Boolean mask where True indicates high confidence regions
         """
-        h, w, c = enhanced_lidar_img.shape
+        h, w, c = lidar_img.shape
 
         # LiDAR coverage and density analysis
-        lidar_coverage = np.any(enhanced_lidar_img > 0, axis=2)
+        lidar_coverage = np.any(lidar_img > 0, axis=2)
 
         # Calculate LiDAR density using gaussian filter
         lidar_density = ndimage.gaussian_filter(
@@ -139,7 +138,7 @@ class FusionAnnotationGenerator:
         high_density_regions = lidar_density > self.lidar_confidence_threshold
 
         # Depth consistency check (simplified)
-        z_channel = enhanced_lidar_img[:, :, 2].astype(float) / 255.0
+        z_channel = lidar_img[:, :, 2].astype(float) / 255.0
         # Areas with reasonable depth values (not extreme)
         reasonable_depth = (z_channel > 0.1) & (z_channel < 0.9)
         depth_confident = reasonable_depth & lidar_coverage
@@ -149,7 +148,7 @@ class FusionAnnotationGenerator:
 
         return confidence_mask
 
-    def fuse_camera_lidar_annotations(self, sam_annotation, enhanced_lidar_img, confidence_mask):
+    def fuse_camera_lidar_annotations(self, sam_annotation, lidar_img, confidence_mask):
         """Fuse camera (SAM) and LiDAR information for improved annotations
 
         Strategy:
@@ -164,12 +163,12 @@ class FusionAnnotationGenerator:
         fusion_annotation = sam_annotation.copy()
 
         # Extract LiDAR geometric information
-        x_channel = enhanced_lidar_img[:, :, 0].astype(float)
-        y_channel = enhanced_lidar_img[:, :, 1].astype(float)
-        z_channel = enhanced_lidar_img[:, :, 2].astype(float)
+        x_channel = lidar_img[:, :, 0].astype(float)
+        y_channel = lidar_img[:, :, 1].astype(float)
+        z_channel = lidar_img[:, :, 2].astype(float)
 
         # LiDAR coverage mask
-        lidar_coverage = np.any(enhanced_lidar_img > 0, axis=2)
+        lidar_coverage = np.any(lidar_img > 0, axis=2)
 
         # Calculate LiDAR density and distance for quality assessment
         lidar_density = ndimage.gaussian_filter(
@@ -181,45 +180,49 @@ class FusionAnnotationGenerator:
 
         # Calculate distance map
         z_norm = z_channel / 255.0
-        distance_map = np.exp(z_norm * np.log(101.0))
+        distance_map = z_norm * 100.0
 
-        # Strategy 1: Enhance object boundaries using LiDAR confirmation
-        # Conservative approach: Only enhance where LiDAR points actually exist
-        # This prevents unrealistic training targets in fusion training
+        # Strategy 1: Enhance object boundaries using LiDAR confirmation OR proximity
+        # Less conservative approach: Enhance SAM objects, use LiDAR for refinement when available
+        # NO dilation applied - maintain exact geometric correspondence
+
+        # Define quality criteria for fusion enhancement (relaxed thresholds)
+        min_density_for_fusion = 0.05  # Lower threshold for fusion (combines modalities) - RELAXED from 0.15
+        max_distance_for_fusion = 80.0  # Higher distance limit for fusion - RELAXED from 50.0
+
         for class_id in [2, 3, 4, 5]:  # vehicle, sign, cyclist, pedestrian
             sam_obj_mask = (sam_annotation == class_id)
 
-            # Only work with SAM-LiDAR overlap regions
+            # Get LiDAR information for the object region
             sam_lidar_overlap = sam_obj_mask & lidar_coverage
 
-            if np.any(sam_lidar_overlap):
-                # Calculate quality metrics for the overlapping regions
-                overlap_density = lidar_density[sam_lidar_overlap]
-                overlap_distances = distance_map[sam_lidar_overlap]
+            if np.any(sam_obj_mask):
+                # For SAM objects: use LiDAR when available, otherwise keep SAM annotation
+                enhanced_mask = sam_obj_mask.copy()
 
-                # Quality criteria for fusion enhancement
-                min_density_for_fusion = 0.15  # Lower threshold for fusion (combines modalities)
-                max_distance_for_fusion = 50.0  # Higher distance limit for fusion
+                # Enhance with LiDAR where available and meets quality criteria
+                if np.any(sam_lidar_overlap):
+                    # Calculate quality metrics for the overlapping regions
+                    overlap_density = lidar_density[sam_lidar_overlap]
+                    overlap_distances = distance_map[sam_lidar_overlap]
 
-                # Find high-quality LiDAR-confirmed regions
-                quality_overlap = np.zeros_like(sam_lidar_overlap)
-                quality_overlap[sam_lidar_overlap] = (
-                    (overlap_density >= min_density_for_fusion) &
-                    (overlap_distances <= max_distance_for_fusion)
-                )
+                    # Quality criteria for LiDAR enhancement (relaxed thresholds)
+                    quality_overlap = np.zeros_like(sam_lidar_overlap)
+                    quality_overlap[sam_lidar_overlap] = (
+                        (overlap_density >= min_density_for_fusion) &
+                        (overlap_distances <= max_distance_for_fusion)
+                    )
 
-                # Apply quality filtering and confidence check
-                confirmed_regions = quality_overlap & confidence_mask
+                    # Apply quality filtering and confidence check
+                    confirmed_regions = quality_overlap & confidence_mask
 
-                if np.any(confirmed_regions):
-                    # Dilate confirmed objects slightly for boundary enhancement
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-                    confirmed_dilated = cv2.dilate(confirmed_regions.astype(np.uint8),
-                                                 kernel, iterations=1)
+                    if np.any(confirmed_regions):
+                        # Apply confirmed regions directly (no dilation for exact geometric correspondence)
+                        enhanced_mask[sam_lidar_overlap] = class_id
 
-                    # Only expand into background (don't overwrite other objects)
-                    valid_expansion = confirmed_dilated & (fusion_annotation == 0)
-                    fusion_annotation[valid_expansion] = class_id
+                # Apply the enhanced mask to fusion annotation
+                fusion_annotation[sam_obj_mask] = class_id  # Keep original SAM objects
+                fusion_annotation[enhanced_mask & (fusion_annotation == 0)] = class_id  # Add enhancements
 
         # Strategy 2: Create ignore regions for low-confidence areas
         # Areas with LiDAR coverage but low confidence
@@ -247,30 +250,27 @@ class FusionAnnotationGenerator:
 
         return fusion_annotation
 
-    def create_ignore_regions_fusion(self, sam_annotation, enhanced_lidar_img, camera_img):
-        """Create minimal ignore regions for fusion training
+    def create_ignore_regions_fusion(self, sam_annotation, lidar_img, camera_img):
+        """Create more conservative ignore regions for fusion training
 
-        Conservative fusion-specific strategy:
-        1. Minimal vertical edge strips (fusion combines modalities well)
-        2. Sparse LiDAR regions (low confidence)
-        3. Extreme depth regions
-        4. Do NOT mark large areas beyond objects as ignore
+        Fusion-specific strategy: More conservative than single-modality approaches
+        to ensure training quality in multi-modal setting.
         """
         ignore_mask = np.zeros_like(sam_annotation, dtype=bool)
 
         h, w = sam_annotation.shape
 
-        # Strategy 1: Minimal vertical edge regions (conservative for fusion)
-        # Fusion combines camera + LiDAR, so minimal edge strips
-        edge_fraction = 0.01  # Only 1% edges
-        edge_height = max(int(h * edge_fraction), 5)  # At least 5 pixels
+        # Strategy 1: More conservative vertical edge regions (fusion needs clean boundaries)
+        # Fusion combines modalities, but edge artifacts can be problematic
+        edge_fraction = 0.03  # Increased from 1% to 3% - more conservative
+        edge_height = max(int(h * edge_fraction), 10)  # At least 10 pixels, increased from 5
         
-        ignore_mask[:edge_height, :] = True  # Top 1%
-        ignore_mask[-edge_height:, :] = True  # Bottom 1%
+        ignore_mask[:edge_height, :] = True  # Top 3%
+        ignore_mask[-edge_height:, :] = True  # Bottom 3%
 
-        # Strategy 2: Sparse LiDAR regions (low geometric confidence)
-        if enhanced_lidar_img is not None:
-            lidar_coverage = np.any(enhanced_lidar_img > 0, axis=2)
+        # Strategy 2: More aggressive sparse LiDAR regions (fusion quality control)
+        if lidar_img is not None:
+            lidar_coverage = np.any(lidar_img > 0, axis=2)
             
             # Calculate LiDAR density
             lidar_density = ndimage.gaussian_filter(
@@ -280,15 +280,21 @@ class FusionAnnotationGenerator:
                 cval=0
             )
             
-            # Mark sparse regions as ignore (< 30% density)
-            sparse_lidar = (lidar_density < 0.30) & lidar_coverage
+            # Mark sparse regions as ignore (< 50% density) - increased from 30%
+            sparse_lidar = (lidar_density < 0.50) & lidar_coverage
             ignore_mask |= sparse_lidar
             
-            # Strategy 3: Extreme depth regions
-            z_channel = enhanced_lidar_img[:, :, 2].astype(float)
-            # Very close or very far (potential artifacts)
-            extreme_depth = ((z_channel < 5) | (z_channel > 250)) & lidar_coverage
+            # Strategy 3: More conservative extreme depth regions
+            z_channel = lidar_img[:, :, 2].astype(float)
+            # Very close or very far (potential artifacts) - expanded range
+            extreme_depth = ((z_channel < 10) | (z_channel > 240)) & lidar_coverage  # Expanded from 5/250
             ignore_mask |= extreme_depth
+
+            # Strategy 4: Low confidence fusion regions (new for fusion)
+            # Areas where LiDAR and camera might disagree
+            confidence_mask = self.create_fusion_confidence_mask(lidar_img, sam_annotation)
+            low_confidence_fusion = lidar_coverage & ~confidence_mask
+            ignore_mask |= low_confidence_fusion
 
         return ignore_mask
 
@@ -301,73 +307,36 @@ class FusionAnnotationGenerator:
                 print(f"  ⚠️  No SAM annotation for {frame_id}")
                 return None
 
-            enhanced_lidar_img = self.load_enhanced_lidar_png(frame_id)
-            if enhanced_lidar_img is None:
-                print(f"  ⚠️  No enhanced lidar_png for {frame_id}")
+            lidar_img = self.load_lidar_png(frame_id)
+            if lidar_img is None:
+                print(f"  ⚠️  No lidar_png for {frame_id}")
                 return None
 
             camera_img = self.load_camera_image(frame_id)
             # Camera image is optional for quality analysis
 
             # Create confidence mask from fusion analysis
-            confidence_mask = self.create_fusion_confidence_mask(enhanced_lidar_img, sam_annotation)
+            confidence_mask = self.create_fusion_confidence_mask(lidar_img, sam_annotation)
 
             # Fuse camera and LiDAR annotations
             fusion_annotation = self.fuse_camera_lidar_annotations(
-                sam_annotation, enhanced_lidar_img, confidence_mask
+                sam_annotation, lidar_img, confidence_mask
             )
 
             # Add fusion-specific ignore regions
             fusion_ignore_mask = self.create_ignore_regions_fusion(
-                sam_annotation, enhanced_lidar_img, camera_img
+                sam_annotation, lidar_img, camera_img
             )
 
             # Apply ignore regions - ONLY to background, preserve object annotations
             can_be_ignored = (fusion_annotation == 0)
             fusion_annotation[fusion_ignore_mask & can_be_ignored] = 1
 
-            # Apply moderate dilation to confirmed objects
-            dilated_annotation = self.apply_fusion_dilation(fusion_annotation, confidence_mask)
-
-            # Clear edge rows to prevent dilation artifacts (consistent with LiDAR)
-            edge_rows = self.fusion_dilation_iterations * 2 + 1
-            h = dilated_annotation.shape[0]
-            
-            # Check if objects near edges
-            has_objects_top = np.any(np.isin(dilated_annotation[edge_rows:edge_rows*2, :], [2, 3, 4, 5]))
-            has_objects_bottom = np.any(np.isin(dilated_annotation[-edge_rows*2:-edge_rows, :], [2, 3, 4, 5]))
-            
-            top_clear = 2 if has_objects_top else edge_rows
-            bottom_clear = 2 if has_objects_bottom else edge_rows
-            
-            dilated_annotation[:top_clear, :] = 0
-            dilated_annotation[-bottom_clear:, :] = 0
-
-            return dilated_annotation
+            return fusion_annotation
 
         except Exception as e:
             print(f"  ❌ Error creating fusion annotation for {frame_id}: {e}")
             return None
-
-    def apply_fusion_dilation(self, annotation, confidence_mask):
-        """Apply moderate dilation to high-confidence object regions"""
-        dilated = annotation.copy()
-
-        # Dilate each object class separately, but only in high-confidence regions
-        for class_id in [2, 3, 4, 5]:  # vehicle, sign, cyclist, pedestrian
-            obj_mask = (annotation == class_id)
-            confident_obj = obj_mask & confidence_mask
-
-            if np.any(confident_obj):
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-                dilated_mask = cv2.dilate(confident_obj.astype(np.uint8),
-                                        kernel, iterations=self.fusion_dilation_iterations)
-
-                # Only expand into background regions (not ignore regions)
-                valid_expansion = dilated_mask & (annotation == 0)
-                dilated[valid_expansion] = class_id
-
-        return dilated
 
     def create_overlay_visualization(self, base_image, colored_mask, title=""):
         """Create overlay visualization with title
@@ -487,7 +456,7 @@ class FusionAnnotationGenerator:
         start_time = time.time()
         
         print(f"\n🎯 Generating fusion annotations combining camera and LiDAR")
-        print(f"Input: SAM + enhanced lidar_png + camera images")
+        print(f"Input: SAM + lidar_png + camera images")
         print(f"Output: {self.fusion_annotation_dir}")
         if create_vis:
             print(f"Visualizations: Camera images with fusion annotation overlays")
@@ -587,20 +556,21 @@ class FusionAnnotationGenerator:
             print(f"📊 Visualizations created: {vis_count:,}")
         print(f"\n📁 Output: {self.fusion_annotation_dir}/")
         print(f"\n🎯 Fusion Training Annotations:")
-        print(f"   📥 Input: SAM + enhanced lidar_png + camera images")
+        print(f"   📥 Input: SAM + lidar_png + camera images")
         print(f"   🎨 Classes: Background(0), Ignore(1), Vehicle(2), Sign(3), Cyclist(4), Pedestrian(5)")
-        print(f"   🔧 Minimal Ignore Strategy for Fusion:")
-        print(f"      - Fusion combines modalities, minimal ignore regions")
-        print(f"      - Only 1% top/bottom edges marked as ignore")
-        print(f"      - Sparse LiDAR detection (< 30% density)")
-        print(f"      - Extreme depth regions")
-        print(f"      - Maximize trainable fusion regions")
-        print(f"   📊 Ignore strategy:")
-        print(f"      - Dynamic top/bottom strips beyond objects")
-        print(f"      - Sparse LiDAR regions")
-        print(f"      - Extreme depth regions")
-        print(f"   ✓ Consistent with camera/LiDAR ignore strategies")
+        print(f"   🔧 Fusion Strategy (DISABLED DILATION for basic PNG compatibility):")
+        print(f"      - 3% top/bottom edges marked as ignore (increased from 1%)")
+        print(f"      - Sparse LiDAR regions (< 50% density, increased from 30%)")
+        print(f"      - Expanded extreme depth regions (< 10 or > 240)")
+        print(f"      - Low confidence fusion regions (new)")
+        print(f"      - NO dilation applied - exact geometric correspondence")
+        print(f"      - Ensure training quality in multi-modal setting")
+        print(f"   📊 Relaxed Quality Thresholds:")
+        print(f"      - Min LiDAR density: 0.05 (relaxed from 0.15)")
+        print(f"      - Max fusion distance: 80.0m (relaxed from 50.0m)")
+        print(f"   ✓ Less conservative fusion logic: SAM objects enhanced even without direct LiDAR confirmation")
         print(f"   ✓ Objects preserved: Full annotations, no interior holes")
+        print(f"   ✓ Exact geometric correspondence: No dilation applied")
         if create_vis:
             print(f"   📸 Visualizations: Camera images with fusion annotation overlays")
         print(f"   🎯 Purpose: Multi-modal fusion training with quality-aware regions")
@@ -621,17 +591,16 @@ PERFORMANCE OPTIMIZATIONS:
 
 REQUIRES: Run generate_sam.py and generate_lidar_png.py first!
 
-Fusion Strategy (UPDATED - Minimal Ignore):
+Fusion Strategy (UPDATED - Less Conservative):
 1. Start with SAM camera-based segmentation as foundation
-2. Use enhanced LiDAR geometric projections for validation and refinement
-3. Enhance object boundaries where LiDAR confirms camera detections
-4. **MINIMAL** ignore regions for fusion training:
-   - Only 1% top/bottom edges as ignore (conservative)
-   - Sparse LiDAR regions (< 30% density)
-   - Extreme depth regions (< 5 or > 250 normalized)
-5. Preserve full object annotations (no interior holes)
-6. Adaptive edge clearing after dilation
-7. **Camera-based visualizations**: Overlay annotations on camera images
+2. Use LiDAR geometric projections for validation and refinement
+3. Enhance object boundaries where LiDAR confirms camera detections OR use proximity
+4. **More conservative** ignore regions for fusion training quality:
+   - 3% top/bottom edges as ignore (increased from 1%)
+   - Sparse LiDAR regions (< 50% density, increased from 30%)
+   - Expanded extreme depth regions (< 10 or > 240, expanded from 5/250)
+   - Low confidence fusion regions (new)
+5. Maintain exact geometric correspondence with LiDAR PNG coordinates (no dilation)
 
 **Why Background vs Ignore?**
   Background (0): Definite negative samples - model learns "not an object"
@@ -673,7 +642,7 @@ Usage examples:
     parser.add_argument('--sam-dir', type=str, default='annotation_sam',
                        help='Directory containing SAM annotations relative to output-root (default: annotation_sam)')
     parser.add_argument('--lidar-dir', type=str, default='lidar_png',
-                       help='Directory containing enhanced LiDAR PNGs relative to output-root (default: lidar_png)')
+                       help='Directory containing LiDAR PNGs relative to output-root (default: lidar_png)')
     parser.add_argument('--camera-dir', type=str, default='camera',
                        help='Directory containing camera images relative to output-root (default: camera)')
     parser.add_argument('--fusion-dir', type=str, default='annotation_fusion',
@@ -693,7 +662,7 @@ Usage examples:
     print("="*60)
     print("Fusion Annotation Generator (Optimized)")
     print("="*60)
-    print(f"Input: SAM + enhanced lidar_png + camera images")
+    print(f"Input: SAM + lidar_png + camera images")
     print(f"Output: {OUTPUT_ROOT / FUSION_DIR}")
 
     generator = FusionAnnotationGenerator(
