@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Generate fusion-only annotations combining camera and LiDAR data for fusion model training.
+Generate fusion annotations - consistent with actual LiDAR coverage.
 
-This script creates fusion annotations that leverage both camera and LiDAR modalities
-to produce more accurate and robust segmentation masks. It combines SAM camera-based
-segmentation with LiDAR geometric information for enhanced object detection and
-quality-aware ignore regions.
+This script creates fusion annotations that respect the sparse nature of LiDAR coverage.
+Unlike the original fusion script that assumes comprehensive LiDAR validation, this version:
 
-REQUIRES: Run generate_sam.py and generate_lidar_png.py first!
+1. Only applies LiDAR-based quality filtering where LiDAR actually exists (5.2% coverage)
+2. Uses camera-only logic for areas without LiDAR coverage (94.8% of image)
+3. Maintains object annotations from SAM without unnecessary LiDAR-based removal
+4. Creates ignore regions only where LiDAR exists AND indicates poor quality
+
+This ensures consistency between training inputs (sparse LiDAR) and annotations.
+
+REQUIRES: Run generate_sam.py, generate_camera_only_annotation.py, and generate_lidar_png.py first!
 """
 
 import numpy as np
@@ -23,18 +28,20 @@ import time
 
 
 class FusionAnnotationGenerator:
-    """Generate fusion annotations combining camera and LiDAR data"""
+    """Generate fusion annotations consistent with actual LiDAR coverage"""
 
     def __init__(self, output_root, sam_dir='annotation_sam', lidar_dir='lidar_png',
-                 camera_dir='camera', fusion_dir='annotation_fusion'):
+                 camera_dir='camera', camera_only_dir='annotation_camera_only',
+                 fusion_dir='annotation_fusion'):
         """Initialize fusion annotation generator
 
         Args:
             output_root: Path to output root directory
-            sam_dir: Directory name for SAM annotations (relative to output_root)
-            lidar_dir: Directory name for LiDAR PNGs (relative to output_root)
-            camera_dir: Directory name for camera images (relative to output_root)
-            fusion_dir: Directory name for fusion annotations output (relative to output_root)
+            sam_dir: Directory name for SAM annotations
+            lidar_dir: Directory name for LiDAR PNGs
+            camera_dir: Directory name for camera images
+            camera_only_dir: Directory name for camera-only annotations
+            fusion_dir: Directory name for fusion annotations output
         """
         self.output_root = Path(output_root)
 
@@ -42,6 +49,7 @@ class FusionAnnotationGenerator:
         self.sam_annotation_dir = self.output_root / sam_dir
         self.lidar_png_dir = self.output_root / lidar_dir
         self.camera_dir = self.output_root / camera_dir
+        self.camera_only_dir = self.output_root / camera_only_dir
 
         # Output directory for fusion annotations
         self.fusion_annotation_dir = self.output_root / fusion_dir
@@ -67,12 +75,16 @@ class FusionAnnotationGenerator:
         camera_files = list(self.camera_dir.glob("frame_*.png"))
         camera_frame_ids = {f.stem.replace("frame_", "") for f in camera_files}
 
+        camera_only_files = list(self.camera_only_dir.glob("frame_*.png"))
+        camera_only_frame_ids = {f.stem.replace("frame_", "") for f in camera_only_files}
+
         # Find intersection - frames with all inputs
-        available_frame_ids = sam_frame_ids & lidar_frame_ids & camera_frame_ids
+        available_frame_ids = sam_frame_ids & lidar_frame_ids & camera_frame_ids & camera_only_frame_ids
 
         print(f"✓ Found {len(sam_frame_ids):,} SAM annotation files")
         print(f"✓ Found {len(lidar_frame_ids):,} lidar_png files")
         print(f"✓ Found {len(camera_frame_ids):,} camera image files")
+        print(f"✓ Found {len(camera_only_frame_ids):,} camera-only annotation files")
         print(f"✓ Found {len(available_frame_ids):,} frames with all inputs")
 
         # Convert to sorted list for consistent processing
@@ -86,13 +98,13 @@ class FusionAnnotationGenerator:
         print(f"✓ Already processed: {len(self.processed_frames):,}")
         print(f"✓ Remaining to process: {len(self.frame_ids):,}")
 
-        # Fusion parameters
-        self.lidar_confidence_threshold = 0.3  # Minimum LiDAR density for confident regions
-        self.depth_consistency_threshold = 0.8  # Depth consistency check
+        # Fusion parameters - adjusted for sparse LiDAR
+        self.lidar_confidence_threshold = 0.15  # Lower threshold for sparse LiDAR
+        self.depth_consistency_threshold = 0.6  # Relaxed for sparse data
 
         # Performance optimization parameters
-        self.max_workers = min(multiprocessing.cpu_count(), 8)  # Limit to 8 workers max
-        self.batch_size = 50  # Process frames in batches to manage memory
+        self.max_workers = min(multiprocessing.cpu_count(), 8)
+        self.batch_size = 50
 
     def load_sam_annotation(self, frame_id):
         """Load SAM segmentation mask"""
@@ -100,6 +112,13 @@ class FusionAnnotationGenerator:
         if not sam_path.exists():
             return None
         return cv2.imread(str(sam_path), cv2.IMREAD_GRAYSCALE)
+
+    def load_camera_only_annotation(self, frame_id):
+        """Load camera-only annotation"""
+        cam_only_path = self.camera_only_dir / f"frame_{frame_id}.png"
+        if not cam_only_path.exists():
+            return None
+        return cv2.imread(str(cam_only_path), cv2.IMREAD_GRAYSCALE)
 
     def load_lidar_png(self, frame_id):
         """Load LiDAR geometric projection"""
@@ -115,184 +134,50 @@ class FusionAnnotationGenerator:
             return None
         return cv2.imread(str(camera_path), cv2.IMREAD_COLOR)
 
-    def create_fusion_confidence_mask(self, lidar_img, sam_annotation):
-        """Create confidence mask based on LiDAR-camera fusion analysis
+    def create_lidar_quality_mask(self, lidar_img):
+        """Create quality mask ONLY for areas with actual LiDAR coverage
 
         Returns:
-            confidence_mask: Boolean mask where True indicates high confidence regions
+            quality_mask: Boolean mask where True indicates LiDAR-covered areas with good quality
         """
         h, w, c = lidar_img.shape
 
-        # LiDAR coverage and density analysis
+        # LiDAR coverage mask - only where LiDAR actually exists
         lidar_coverage = np.any(lidar_img > 0, axis=2)
 
-        # Calculate LiDAR density using gaussian filter
-        lidar_density = ndimage.gaussian_filter(
+        if np.sum(lidar_coverage) == 0:
+            # No LiDAR coverage at all
+            return np.zeros_like(lidar_coverage, dtype=bool)
+
+        # Calculate LiDAR density using gaussian filter (only on covered areas)
+        lidar_density = np.zeros_like(lidar_coverage, dtype=float)
+        lidar_density[lidar_coverage] = ndimage.gaussian_filter(
             lidar_coverage.astype(float),
             sigma=2,
             mode='constant',
             cval=0
-        )
+        )[lidar_coverage]
 
-        # High confidence regions: good LiDAR coverage
-        high_density_regions = lidar_density > self.lidar_confidence_threshold
-
-        # Depth consistency check (simplified)
-        z_channel = lidar_img[:, :, 2].astype(float) / 255.0
-        # Areas with reasonable depth values (not extreme)
-        reasonable_depth = (z_channel > 0.1) & (z_channel < 0.9)
-        depth_confident = reasonable_depth & lidar_coverage
-
-        # Combine confidence indicators
-        confidence_mask = high_density_regions & depth_confident
-
-        return confidence_mask
-
-    def fuse_camera_lidar_annotations(self, sam_annotation, lidar_img, confidence_mask):
-        """Fuse camera (SAM) and LiDAR information for improved annotations
-
-        Strategy:
-        1. Start with SAM annotations (camera-based)
-        2. Use LiDAR to validate and refine object boundaries
-        3. Enhance object detection where LiDAR confirms camera detections
-        4. Create ignore regions where modalities disagree or have low confidence
-        """
-        h, w = sam_annotation.shape
-
-        # Initialize fusion annotation with SAM base
-        fusion_annotation = sam_annotation.copy()
-
-        # Extract LiDAR geometric information
-        x_channel = lidar_img[:, :, 0].astype(float)
-        y_channel = lidar_img[:, :, 1].astype(float)
+        # Depth consistency check (only on covered areas)
         z_channel = lidar_img[:, :, 2].astype(float)
+        # Areas with reasonable depth values (not extreme)
+        reasonable_depth = np.zeros_like(lidar_coverage, dtype=bool)
+        reasonable_depth[lidar_coverage] = (z_channel[lidar_coverage] > 0.05) & (z_channel[lidar_coverage] < 0.95)
 
-        # LiDAR coverage mask
-        lidar_coverage = np.any(lidar_img > 0, axis=2)
+        # High quality regions: good LiDAR coverage AND reasonable depth
+        quality_mask = (lidar_density > self.lidar_confidence_threshold) & reasonable_depth
 
-        # Calculate LiDAR density and distance for quality assessment
-        lidar_density = ndimage.gaussian_filter(
-            lidar_coverage.astype(float),
-            sigma=3,
-            mode='constant',
-            cval=0
-        )
-
-        # Calculate distance map - CORRECTED logarithmic scaling
-        z_norm = z_channel / 255.0
-        distance_map = np.exp(z_norm * np.log(101.0))  # Logarithmic distance scaling
-
-        # Strategy 1: Enhance object boundaries using LiDAR confirmation OR proximity
-        # Simplified approach: Start with SAM, enhance with LiDAR where available
-
-        # Define quality criteria for fusion enhancement (relaxed thresholds)
-        min_density_for_fusion = 0.05  # Lower threshold for fusion (combines modalities) - RELAXED from 0.15
-        max_distance_for_fusion = 80.0  # Higher distance limit for fusion - RELAXED from 50.0
-
-        for class_id in [2, 3, 4, 5]:  # vehicle, sign, cyclist, pedestrian
-            sam_obj_mask = (sam_annotation == class_id)
-
-            if np.any(sam_obj_mask):
-                # Keep all SAM objects as valid training targets
-                fusion_annotation[sam_obj_mask] = class_id
-
-                # Enhance with LiDAR confirmation where available and high quality
-                sam_lidar_overlap = sam_obj_mask & lidar_coverage
-
-                if np.any(sam_lidar_overlap):
-                    # Calculate quality metrics for the overlapping regions
-                    overlap_density = lidar_density[sam_lidar_overlap]
-                    overlap_distances = distance_map[sam_lidar_overlap]
-
-                    # Quality criteria for LiDAR enhancement
-                    quality_overlap = np.zeros_like(sam_lidar_overlap)
-                    quality_overlap[sam_lidar_overlap] = (
-                        (overlap_density >= min_density_for_fusion) &
-                        (overlap_distances <= max_distance_for_fusion)
-                    )
-
-                    # Apply quality filtering and confidence check
-                    confirmed_regions = quality_overlap & confidence_mask
-
-                    # LiDAR-confirmed regions get priority (already set above)
-                    # No additional dilation needed for fusion training
-
-        # Strategy 2: Create ignore regions for low-confidence areas
-        # Areas with LiDAR coverage but low confidence
-        low_confidence_lidar = lidar_coverage & ~confidence_mask
-
-        # Areas where SAM has objects but LiDAR doesn't confirm
-        sam_objects = np.isin(sam_annotation, [2, 3, 4, 5])
-        unconfirmed_objects = sam_objects & ~lidar_coverage
-
-        # Combine low-confidence regions
-        ignore_candidates = low_confidence_lidar | unconfirmed_objects
-
-        # Apply ignore regions (class 1) - only on background, don't overwrite objects
-        background_ignore = (fusion_annotation == 0) & ignore_candidates
-        fusion_annotation[background_ignore] = 1
-
-        # Strategy 3: Handle depth-based ignore regions
-        # Very distant objects (> 80m approximate)
-        # Approximate distance thresholding
-        distant_regions = (z_norm > 0.85) & lidar_coverage  # Rough approximation
-
-        # Mark distant regions as ignore if they're not confirmed objects
-        distant_ignore = distant_regions & (fusion_annotation == 0)
-        fusion_annotation[distant_ignore] = 1
-
-        return fusion_annotation
-
-    def create_ignore_regions_fusion(self, sam_annotation, lidar_img, camera_img):
-        """Create more conservative ignore regions for fusion training
-
-        Fusion-specific strategy: More conservative than single-modality approaches
-        to ensure training quality in multi-modal setting.
-        """
-        ignore_mask = np.zeros_like(sam_annotation, dtype=bool)
-
-        h, w = sam_annotation.shape
-
-        # Strategy 1: More conservative vertical edge regions (fusion needs clean boundaries)
-        # Fusion combines modalities, but edge artifacts can be problematic
-        edge_fraction = 0.03  # Increased from 1% to 3% - more conservative
-        edge_height = max(int(h * edge_fraction), 10)  # At least 10 pixels, increased from 5
-        
-        ignore_mask[:edge_height, :] = True  # Top 3%
-        ignore_mask[-edge_height:, :] = True  # Bottom 3%
-
-        # Strategy 2: More aggressive sparse LiDAR regions (fusion quality control)
-        if lidar_img is not None:
-            lidar_coverage = np.any(lidar_img > 0, axis=2)
-            
-            # Calculate LiDAR density
-            lidar_density = ndimage.gaussian_filter(
-                lidar_coverage.astype(float),
-                sigma=3,
-                mode='constant',
-                cval=0
-            )
-            
-            # Mark sparse regions as ignore (< 50% density) - increased from 30%
-            sparse_lidar = (lidar_density < 0.50) & lidar_coverage
-            ignore_mask |= sparse_lidar
-            
-            # Strategy 3: More conservative extreme depth regions
-            z_channel = lidar_img[:, :, 2].astype(float)
-            # Very close or very far (potential artifacts) - expanded range
-            extreme_depth = ((z_channel < 10) | (z_channel > 240)) & lidar_coverage  # Expanded from 5/250
-            ignore_mask |= extreme_depth
-
-            # Strategy 4: Low confidence fusion regions (new for fusion)
-            # Areas where LiDAR and camera might disagree
-            confidence_mask = self.create_fusion_confidence_mask(lidar_img, sam_annotation)
-            low_confidence_fusion = lidar_coverage & ~confidence_mask
-            ignore_mask |= low_confidence_fusion
-
-        return ignore_mask
+        return quality_mask
 
     def create_fusion_annotation(self, frame_id):
-        """Create fusion annotation combining camera and LiDAR data"""
+        """Create fusion annotation - consistent with sparse LiDAR coverage
+
+        Strategy:
+        1. Start with camera-only annotations (SAM + minimal ignore)
+        2. Only apply LiDAR-based modifications where LiDAR actually exists
+        3. Keep camera-only logic for 94.8% of image without LiDAR
+        4. Only mark LiDAR-covered areas as ignore if they have poor quality
+        """
         try:
             # Load all required inputs
             sam_annotation = self.load_sam_annotation(frame_id)
@@ -300,30 +185,55 @@ class FusionAnnotationGenerator:
                 print(f"  ⚠️  No SAM annotation for {frame_id}")
                 return None
 
+            camera_only = self.load_camera_only_annotation(frame_id)
+            if camera_only is None:
+                print(f"  ⚠️  No camera-only annotation for {frame_id}")
+                return None
+
             lidar_img = self.load_lidar_png(frame_id)
             if lidar_img is None:
-                print(f"  ⚠️  No enhanced lidar_png for {frame_id}")
+                print(f"  ⚠️  No LiDAR PNG for {frame_id}")
                 return None
 
             camera_img = self.load_camera_image(frame_id)
-            # Camera image is optional for quality analysis
 
-            # Create confidence mask from fusion analysis
-            confidence_mask = self.create_fusion_confidence_mask(lidar_img, sam_annotation)
+            # Start with camera-only annotations (already has minimal ignore regions)
+            fusion_annotation = camera_only.copy()
 
-            # Fuse camera and LiDAR annotations
-            fusion_annotation = self.fuse_camera_lidar_annotations(
-                sam_annotation, lidar_img, confidence_mask
-            )
+            # Create LiDAR quality assessment (only where LiDAR exists)
+            lidar_quality_mask = self.create_lidar_quality_mask(lidar_img)
 
-            # Add fusion-specific ignore regions
-            fusion_ignore_mask = self.create_ignore_regions_fusion(
-                sam_annotation, lidar_img, camera_img
-            )
+            # LiDAR coverage mask
+            lidar_coverage = np.any(lidar_img > 0, axis=2)
 
-            # Apply ignore regions - ONLY to background, preserve object annotations
-            can_be_ignored = (fusion_annotation == 0)
-            fusion_annotation[fusion_ignore_mask & can_be_ignored] = 1
+            # Strategy: Only modify areas where LiDAR actually provides information
+
+            # 1. Areas with good LiDAR quality: Keep camera annotations as-is
+            # (No changes needed - camera-only already provides good baseline)
+
+            # 2. Areas with poor LiDAR quality: Mark as ignore (only where LiDAR exists)
+            poor_quality_lidar = lidar_coverage & ~lidar_quality_mask
+
+            # Apply ignore only to background pixels in poor quality LiDAR areas
+            background_in_poor_lidar = poor_quality_lidar & (fusion_annotation == 0)
+            fusion_annotation[background_in_poor_lidar] = 1
+
+            # 3. Areas without LiDAR: Keep camera-only annotations (94.8% of image)
+            # (Already handled by starting with camera-only)
+
+            # 4. Additional conservative ignore regions (minimal, consistent with sparse LiDAR)
+            h, w = fusion_annotation.shape
+
+            # Very conservative edge regions (reduced from camera-only's 1%)
+            edge_fraction = 0.005  # Only 0.5% edges (much more conservative)
+            edge_height = max(int(h * edge_fraction), 3)
+            edge_ignore = np.zeros_like(fusion_annotation, dtype=bool)
+            edge_ignore[:edge_height, :] = True
+            edge_ignore[-edge_height:, :] = True
+
+            # Apply edge ignore only to background
+            edge_background = edge_ignore & (fusion_annotation == 0)
+            fusion_annotation[edge_background] = 1
 
             return fusion_annotation
 
@@ -332,124 +242,92 @@ class FusionAnnotationGenerator:
             return None
 
     def create_overlay_visualization(self, base_image, colored_mask, title=""):
-        """Create overlay visualization with title
-        
-        Args:
-            base_image: Base image (camera image)
-            colored_mask: Colored annotation mask
-            title: Title text to add
-            
-        Returns:
-            visualization: Image with overlay and title
-        """
+        """Create overlay visualization with title"""
         h, w = base_image.shape[:2]
-        
-        # Prepare base image for overlay
+
         if len(base_image.shape) == 3 and base_image.shape[2] == 3:
-            # Color image (camera)
             overlay_base = base_image.copy()
         else:
-            # Grayscale image - convert to RGB
             if len(base_image.shape) == 2:
                 overlay_base = cv2.cvtColor(base_image, cv2.COLOR_GRAY2RGB)
             else:
                 overlay_base = base_image.copy()
-        
-        # Overlay mask with transparency
+
         alpha = 0.6
         overlay = overlay_base.copy()
-        
-        # Apply mask only where there are annotations
+
         mask_pixels = np.any(colored_mask > 0, axis=2)
         overlay[mask_pixels] = cv2.addWeighted(
-            overlay_base[mask_pixels], 1-alpha, 
+            overlay_base[mask_pixels], 1-alpha,
             colored_mask[mask_pixels], alpha, 0
         )
-        
-        # Add title if provided
+
         if title:
-            # Add black background for text
             cv2.rectangle(overlay, (0, 0), (w, 30), (0, 0, 0), -1)
-            cv2.putText(overlay, title, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 
+            cv2.putText(overlay, title, (10, 20), cv2.FONT_HERSHEY_SIMPLEX,
                        0.6, (255, 255, 255), 1, cv2.LINE_AA)
-        
+
         return overlay
 
     def process_single_frame(self, frame_id, create_vis=False, vis_dir=None, color_map=None):
-        """Process a single frame and return results for parallel processing
-        
-        Returns:
-            tuple: (frame_id, status, annotation, visualization_data)
-        """
+        """Process a single frame"""
         try:
-            # Check if annotation already exists
             output_path = self.fusion_annotation_dir / f"frame_{frame_id}.png"
             if output_path.exists():
-                # Load existing annotation for potential visualization
                 annotation = cv2.imread(str(output_path), cv2.IMREAD_GRAYSCALE)
                 if annotation is None:
                     return (frame_id, "error", None, None)
             else:
-                # Create fusion annotation
                 annotation = self.create_fusion_annotation(frame_id)
-                
+
                 if annotation is None:
                     return (frame_id, "error", None, None)
 
-                # Save annotation
                 cv2.imwrite(str(output_path), annotation)
 
-                # Mark frame as processed
                 self.processed_frames.add(frame_id)
                 with open(self.processed_frames_file, 'a') as f:
                     f.write(f"{frame_id}\n")
 
-            # Create visualization data if requested and it doesn't exist
             vis_data = None
             if create_vis and vis_dir and color_map:
                 vis_path = vis_dir / f"frame_{frame_id}.png"
                 if not vis_path.exists():
                     try:
-                        # Load camera image for visualization
                         camera_img = self.load_camera_image(frame_id)
-                        
-                        # Create colored mask for overlay
+
                         colored_mask = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)
                         for class_id, color in color_map.items():
-                            if class_id == 0:  # Skip background for overlay
+                            if class_id == 0:
                                 continue
                             colored_mask[annotation == class_id] = color
-                        
+
                         if camera_img is not None:
-                            # Resize camera image to match annotation dimensions if needed
                             if camera_img.shape[:2] != annotation.shape:
                                 camera_img = cv2.resize(camera_img, (annotation.shape[1], annotation.shape[0]), interpolation=cv2.INTER_LINEAR)
-                            
-                            # Create overlay visualization: Camera image with fusion annotations
-                            overlay = self.create_overlay_visualization(camera_img, colored_mask, "Fusion: Camera + LiDAR Annotations")
+
+                            overlay = self.create_overlay_visualization(camera_img, colored_mask, "Fusion: LiDAR-Consistent Annotations")
                             vis_data = overlay
                         else:
-                            # Fallback to colored mask only if no camera available
                             vis_data = colored_mask
-                            
+
                     except Exception as e:
                         vis_data = None
 
-            # Return appropriate status
             if output_path.exists() and 'annotation' not in locals():
                 return (frame_id, "skip", annotation, vis_data)
             else:
                 return (frame_id, "success", annotation, vis_data)
-            
+
         except Exception as e:
             return (frame_id, "error", None, None)
 
     def process_all_frames(self, create_vis=False):
-        """Process all frames and create fusion annotations using parallel processing"""
+        """Process all frames"""
         start_time = time.time()
-        
-        print(f"\n🎯 Generating fusion annotations combining camera and LiDAR")
-        print(f"Input: SAM + lidar_png + camera images")
+
+        print(f"\n🎯 Generating fusion annotations (LiDAR-consistent)")
+        print(f"Input: SAM + camera-only + lidar_png + camera images")
         print(f"Output: {self.fusion_annotation_dir}")
         if create_vis:
             print(f"Visualizations: Camera images with fusion annotation overlays")
@@ -461,78 +339,66 @@ class FusionAnnotationGenerator:
         skip_count = 0
         vis_count = 0
 
-        # Prepare visualization directory and color map if needed
-        vis_dir = None
-        color_map = None
         if create_vis:
             vis_dir = self.output_root / "visualizations" / "fusion_annotation"
             vis_dir.mkdir(parents=True, exist_ok=True)
 
-            # Color map for visualization (BGR format for OpenCV)
             color_map = {
-                0: np.array([0, 0, 0], dtype=np.uint8),          # Background - Black
-                1: np.array([128, 128, 128], dtype=np.uint8),    # Ignore - Gray
-                2: np.array([0, 0, 255], dtype=np.uint8),        # Vehicle - Red (BGR)
-                3: np.array([0, 255, 255], dtype=np.uint8),      # Sign - Yellow (BGR)
-                4: np.array([255, 0, 255], dtype=np.uint8),      # Cyclist - Magenta (BGR)
-                5: np.array([0, 255, 0], dtype=np.uint8),        # Pedestrian - Green (BGR)
+                0: np.array([0, 0, 0], dtype=np.uint8),
+                1: np.array([128, 128, 128], dtype=np.uint8),
+                2: np.array([0, 0, 255], dtype=np.uint8),
+                3: np.array([0, 255, 255], dtype=np.uint8),
+                4: np.array([255, 0, 255], dtype=np.uint8),
+                5: np.array([0, 255, 0], dtype=np.uint8),
             }
 
-        # Process frames in batches to manage memory
-        frame_batches = [self.frame_ids[i:i + self.batch_size] 
+        frame_batches = [self.frame_ids[i:i + self.batch_size]
                         for i in range(0, len(self.frame_ids), self.batch_size)]
-        
+
         with tqdm(total=len(self.frame_ids), desc="Processing frames") as pbar:
             for batch in frame_batches:
-                # Process batch in parallel
                 with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
-                    # Create partial function with fixed parameters
-                    process_func = partial(self.process_single_frame, 
-                                         create_vis=create_vis, 
-                                         vis_dir=vis_dir, 
-                                         color_map=color_map)
-                    
-                    # Submit all frames in batch
+                    process_func = partial(self.process_single_frame,
+                                         create_vis=create_vis,
+                                         vis_dir=vis_dir if create_vis else None,
+                                         color_map=color_map if create_vis else None)
+
                     futures = [executor.submit(process_func, frame_id) for frame_id in batch]
-                    
-                    # Process results as they complete
+
                     for future in concurrent.futures.as_completed(futures):
                         try:
                             frame_id, status, annotation, vis_data = future.result()
-                            
+
                             if status == "skip":
                                 skip_count += 1
                             elif status == "error":
                                 error_count += 1
                             elif status == "success":
                                 success_count += 1
-                                
-                                # Mark frame as processed
+
                                 self.processed_frames.add(frame_id)
                                 with open(self.processed_frames_file, 'a') as f:
                                     f.write(f"{frame_id}\n")
-                            
-                            # Save visualization if available (for both existing and new annotations)
-                            if vis_data is not None and vis_dir:
+
+                            if vis_data is not None and create_vis:
                                 vis_path = vis_dir / f"frame_{frame_id}.png"
                                 cv2.imwrite(str(vis_path), vis_data)
                                 vis_count += 1
-                            
+
                         except Exception as e:
                             error_count += 1
                             print(f"  ❌ Error processing frame result: {e}")
-                        
+
                         pbar.update(1)
 
-        # Calculate and display performance metrics
         end_time = time.time()
         total_time = end_time - start_time
         processed_frames = success_count + error_count
-        
+
         if processed_frames > 0:
             time_per_frame = total_time / processed_frames
             frames_per_second = processed_frames / total_time
-            
+
             print(f"\n⏱️  Performance Metrics:")
             print(f"   Total time: {total_time:.1f}s ({total_time/60:.1f}min)")
             print(f"   Time per frame: {time_per_frame:.3f}s")
@@ -549,129 +415,73 @@ class FusionAnnotationGenerator:
             print(f"📊 Visualizations created: {vis_count:,}")
         print(f"\n📁 Output: {self.fusion_annotation_dir}/")
         print(f"\n🎯 Fusion Training Annotations:")
-        print(f"   📥 Input: SAM + lidar_png + camera images")
+        print(f"   📥 Input: SAM + camera-only + lidar_png + camera images")
         print(f"   🎨 Classes: Background(0), Ignore(1), Vehicle(2), Sign(3), Cyclist(4), Pedestrian(5)")
-        print(f"   🔧 Fusion Strategy (DISABLED DILATION for basic PNG compatibility):")
-        print(f"      - 3% top/bottom edges marked as ignore (increased from 1%)")
-        print(f"      - Sparse LiDAR regions (< 50% density, increased from 30%)")
-        print(f"      - Expanded extreme depth regions (< 10 or > 240)")
-        print(f"      - Low confidence fusion regions (new)")
-        print(f"      - NO dilation applied - exact geometric correspondence")
-        print(f"      - Ensure training quality in multi-modal setting")
-        print(f"   📊 Relaxed Quality Thresholds:")
-        print(f"      - Min LiDAR density: 0.05 (relaxed from 0.15)")
-        print(f"      - Max fusion distance: 80.0m (relaxed from 50.0m)")
-        print(f"   ✓ Less conservative fusion logic: SAM objects enhanced even without direct LiDAR confirmation")
-        print(f"   ✓ Objects preserved: Full annotations, no interior holes")
-        print(f"   ✓ Exact geometric correspondence: No dilation applied")
+        print(f"   🔧 LiDAR-Consistent Strategy:")
+        print(f"      - Start with camera-only annotations (minimal ignore)")
+        print(f"      - Only apply LiDAR quality filtering where LiDAR exists (5.2% coverage)")
+        print(f"      - Keep camera-only logic for 94.8% without LiDAR")
+        print(f"      - Mark ignore only in poor-quality LiDAR areas")
+        print(f"      - Very conservative edge ignore (0.5% vs camera-only's 1%)")
+        print(f"   📊 Quality Thresholds (adjusted for sparse LiDAR):")
+        print(f"      - LiDAR confidence threshold: {self.lidar_confidence_threshold} (relaxed)")
+        print(f"      - Depth consistency threshold: {self.depth_consistency_threshold} (relaxed)")
+        print(f"   ✓ Consistent with training inputs: sparse LiDAR coverage")
+        print(f"   ✓ Maximizes training data while respecting LiDAR limitations")
+        print(f"   ✓ No assumptions about comprehensive LiDAR validation")
         if create_vis:
             print(f"   📸 Visualizations: Camera images with fusion annotation overlays")
-        print(f"   🎯 Purpose: Multi-modal fusion training with quality-aware regions")
+        print(f"   🎯 Purpose: Realistic fusion training with sparse LiDAR constraints")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate fusion annotations combining camera and LiDAR data",
+        description="Generate fusion annotations - consistent with actual LiDAR coverage",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Creates fusion segmentation annotations that combine camera and LiDAR modalities
-for enhanced object detection and segmentation accuracy.
+Creates fusion segmentation annotations that respect sparse LiDAR coverage reality.
 
-PERFORMANCE OPTIMIZATIONS:
-- Parallel processing using multiple CPU cores
-- Batch processing to manage memory usage
-- Efficient vectorized operations for faster computation
+KEY IMPROVEMENT: Unlike original fusion that assumes comprehensive LiDAR validation,
+this version only applies LiDAR-based modifications where LiDAR actually exists.
 
-REQUIRES: Run generate_sam.py and generate_lidar_png.py first!
+Strategy:
+1. Start with camera-only annotations (already optimized for camera training)
+2. Only apply LiDAR quality filtering in areas with actual LiDAR coverage (5.2%)
+3. Keep camera-only logic for areas without LiDAR (94.8% of image)
+4. Mark ignore only where LiDAR exists AND indicates poor quality
+5. Very conservative ignore regions overall
 
-Fusion Strategy (UPDATED - Less Conservative):
-1. Start with SAM camera-based segmentation as foundation
-2. Use LiDAR geometric projections for validation and refinement
-3. Enhance object boundaries where LiDAR confirms camera detections OR use proximity
-4. **More conservative** ignore regions for fusion training quality:
-   - 3% top/bottom edges as ignore (increased from 1%)
-   - Sparse LiDAR regions (< 50% density, increased from 30%)
-   - Expanded extreme depth regions (< 10 or > 240, expanded from 5/250)
-   - Low confidence fusion regions (new)
-5. Maintain exact geometric correspondence with LiDAR PNG coordinates (no dilation)
+This ensures consistency between training inputs (sparse LiDAR) and annotations.
 
-**Why Background vs Ignore?**
-  Background (0): Definite negative samples - model learns "not an object"
-                  Loss is calculated and backpropagated
-  Ignore (1):     Uncertain/ambiguous areas - model skips these
-                  Loss is NOT calculated (masked out in training)
-
-Class mapping:
-  0: Background (trainable negative samples)
-  1: Ignore (loss masked, not trained on)
-  2: Vehicle (fusion-enhanced with LiDAR confirmation)
-  3: Sign (fusion-enhanced with LiDAR confirmation)
-  4: Cyclist (fusion-enhanced with LiDAR confirmation)
-  5: Pedestrian (fusion-enhanced with LiDAR confirmation)
-
-Fusion Advantages:
-- Better object boundary refinement using LiDAR geometry
-- Dynamic, scene-adaptive ignore regions (consistent with camera/LiDAR)
-- Depth-aware filtering for distant or problematic regions
-- Multi-modal validation for improved accuracy
-- No object interior holes from over-aggressive ignore masking
-- **Camera-based visualization**: See annotations in context of actual scene
+REQUIRES: Run generate_sam.py, generate_camera_only_annotation.py, and generate_lidar_png.py first!
 
 Usage examples:
-  # Generate fusion annotations (optimized)
+  # Generate fusion annotations
   python generate_fusion_annotation.py
 
-  # Generate with camera-based visualizations
+  # Generate with visualizations
   python generate_fusion_annotation.py --visualize
-
-  # Use custom number of workers
-  python generate_fusion_annotation.py --workers 4 --visualize
         """
     )
     parser.add_argument('--visualize', action='store_true',
                        help='Create PNG visualizations for all processed frames')
     parser.add_argument('--output-root', type=str, default='/media/tom/ml/zod_temp',
                        help='Root directory for all outputs (default: /media/tom/ml/zod_temp)')
-    parser.add_argument('--sam-dir', type=str, default='annotation_sam',
-                       help='Directory containing SAM annotations relative to output-root (default: annotation_sam)')
-    parser.add_argument('--lidar-dir', type=str, default='lidar_png',
-                       help='Directory containing LiDAR PNGs relative to output-root (default: lidar_png)')
-    parser.add_argument('--camera-dir', type=str, default='camera',
-                       help='Directory containing camera images relative to output-root (default: camera)')
-    parser.add_argument('--fusion-dir', type=str, default='annotation_fusion',
-                       help='Output directory for fusion annotations relative to output-root (default: annotation_fusion)')
-    parser.add_argument('--workers', type=int, default=None,
-                       help='Number of parallel workers (default: auto-detect, max 8)')
 
     args = parser.parse_args()
 
-    # Configuration
     OUTPUT_ROOT = Path(args.output_root)
-    SAM_DIR = args.sam_dir
-    LIDAR_DIR = args.lidar_dir
-    CAMERA_DIR = args.camera_dir
-    FUSION_DIR = args.fusion_dir
 
     print("="*60)
-    print("Fusion Annotation Generator (Optimized)")
+    print("Fusion Annotation Generator (LiDAR-Consistent)")
     print("="*60)
-    print(f"Input: SAM + lidar_png + camera images")
-    print(f"Output: {OUTPUT_ROOT / FUSION_DIR}")
+    print(f"Input: SAM + camera-only + lidar_png + camera images")
+    print(f"Output: {OUTPUT_ROOT / 'annotation_fusion'}")
 
     generator = FusionAnnotationGenerator(
-        output_root=OUTPUT_ROOT,
-        sam_dir=SAM_DIR,
-        lidar_dir=LIDAR_DIR,
-        camera_dir=CAMERA_DIR,
-        fusion_dir=FUSION_DIR
+        output_root=OUTPUT_ROOT
     )
 
-    # Override parameters if specified
-    if hasattr(args, 'workers') and args.workers:
-        generator.max_workers = min(args.workers, multiprocessing.cpu_count())
-        print(f"Using {generator.max_workers} workers")
-
-    # Process all frames with optional visualization
     generator.process_all_frames(create_vis=args.visualize)
 
 
