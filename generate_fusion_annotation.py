@@ -178,13 +178,12 @@ class FusionAnnotationGenerator:
             cval=0
         )
 
-        # Calculate distance map
+        # Calculate distance map - CORRECTED logarithmic scaling
         z_norm = z_channel / 255.0
-        distance_map = z_norm * 100.0
+        distance_map = np.exp(z_norm * np.log(101.0))  # Logarithmic distance scaling
 
         # Strategy 1: Enhance object boundaries using LiDAR confirmation OR proximity
-        # Less conservative approach: Enhance SAM objects, use LiDAR for refinement when available
-        # NO dilation applied - maintain exact geometric correspondence
+        # Simplified approach: Start with SAM, enhance with LiDAR where available
 
         # Define quality criteria for fusion enhancement (relaxed thresholds)
         min_density_for_fusion = 0.05  # Lower threshold for fusion (combines modalities) - RELAXED from 0.15
@@ -193,20 +192,19 @@ class FusionAnnotationGenerator:
         for class_id in [2, 3, 4, 5]:  # vehicle, sign, cyclist, pedestrian
             sam_obj_mask = (sam_annotation == class_id)
 
-            # Get LiDAR information for the object region
-            sam_lidar_overlap = sam_obj_mask & lidar_coverage
-
             if np.any(sam_obj_mask):
-                # For SAM objects: use LiDAR when available, otherwise keep SAM annotation
-                enhanced_mask = sam_obj_mask.copy()
+                # Keep all SAM objects as valid training targets
+                fusion_annotation[sam_obj_mask] = class_id
 
-                # Enhance with LiDAR where available and meets quality criteria
+                # Enhance with LiDAR confirmation where available and high quality
+                sam_lidar_overlap = sam_obj_mask & lidar_coverage
+
                 if np.any(sam_lidar_overlap):
                     # Calculate quality metrics for the overlapping regions
                     overlap_density = lidar_density[sam_lidar_overlap]
                     overlap_distances = distance_map[sam_lidar_overlap]
 
-                    # Quality criteria for LiDAR enhancement (relaxed thresholds)
+                    # Quality criteria for LiDAR enhancement
                     quality_overlap = np.zeros_like(sam_lidar_overlap)
                     quality_overlap[sam_lidar_overlap] = (
                         (overlap_density >= min_density_for_fusion) &
@@ -216,13 +214,8 @@ class FusionAnnotationGenerator:
                     # Apply quality filtering and confidence check
                     confirmed_regions = quality_overlap & confidence_mask
 
-                    if np.any(confirmed_regions):
-                        # Apply confirmed regions directly (no dilation for exact geometric correspondence)
-                        enhanced_mask[sam_lidar_overlap] = class_id
-
-                # Apply the enhanced mask to fusion annotation
-                fusion_annotation[sam_obj_mask] = class_id  # Keep original SAM objects
-                fusion_annotation[enhanced_mask & (fusion_annotation == 0)] = class_id  # Add enhancements
+                    # LiDAR-confirmed regions get priority (already set above)
+                    # No additional dilation needed for fusion training
 
         # Strategy 2: Create ignore regions for low-confidence areas
         # Areas with LiDAR coverage but low confidence
@@ -309,7 +302,7 @@ class FusionAnnotationGenerator:
 
             lidar_img = self.load_lidar_png(frame_id)
             if lidar_img is None:
-                print(f"  ⚠️  No lidar_png for {frame_id}")
+                print(f"  ⚠️  No enhanced lidar_png for {frame_id}")
                 return None
 
             camera_img = self.load_camera_image(frame_id)
