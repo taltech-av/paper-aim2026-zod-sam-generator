@@ -162,7 +162,7 @@ class FusionAnnotationGenerator:
         z_channel = lidar_img[:, :, 2].astype(float)
         # Areas with reasonable depth values (not extreme)
         reasonable_depth = np.zeros_like(lidar_coverage, dtype=bool)
-        reasonable_depth[lidar_coverage] = (z_channel[lidar_coverage] > 0.05) & (z_channel[lidar_coverage] < 0.95)
+        reasonable_depth[lidar_coverage] = (z_channel[lidar_coverage] > 12) & (z_channel[lidar_coverage] < 243)
 
         # High quality regions: good LiDAR coverage AND reasonable depth
         quality_mask = (lidar_density > self.lidar_confidence_threshold) & reasonable_depth
