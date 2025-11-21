@@ -23,7 +23,7 @@ SPLITS_DIR = OUTPUT_DIR / "splits_balanced"
 DATASET_ROOT = Path("/media/tom/ml/zod-data")
 
 # Weather conditions
-CONDITIONS = ['day_fair', 'day_rain', 'night_fair', 'night_rain']
+CONDITIONS = ['day_fair', 'day_rain', 'night_fair', 'night_rain', 'snow']
 
 # Class mapping
 CLASS_NAMES = {
@@ -45,15 +45,21 @@ def get_weather_from_metadata(frame_id):
 
             # Extract weather
             scraped_weather = str(zod_metadata.get("scraped_weather", "")).lower()
-            precipitation_keywords = ["rain", "snow", "sleet", "hail", "storm", "drizzle"]
-            has_precipitation = any(keyword in scraped_weather for keyword in precipitation_keywords)
-            weather = "rain" if has_precipitation else "fair"
+            if "snow" in scraped_weather:
+                weather = "snow"
+            elif any(keyword in scraped_weather for keyword in ["rain", "sleet", "hail", "storm", "drizzle"]):
+                weather = "rain"
+            else:
+                weather = "fair"
 
             # Extract time of day
             time_of_day = str(zod_metadata.get("time_of_day", "day")).lower()
             timeofday = "night" if "night" in time_of_day else "day"
 
-            condition = f"{timeofday}_{weather}"
+            if weather == "snow":
+                condition = "snow"
+            else:
+                condition = f"{timeofday}_{weather}"
             return condition if condition in CONDITIONS else None
     except Exception:
         pass
