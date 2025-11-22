@@ -98,6 +98,9 @@ def analyze_frames_pixel_distribution(frame_paths, split_name, condition):
             print(f"    Warning: Could not load: {annotation_path}")
             continue
         
+        # Resize to 384x384 to match training resolution
+        mask = cv2.resize(mask, (384, 384), interpolation=cv2.INTER_NEAREST)
+        
         # Count pixels for each class
         unique, counts = np.unique(mask, return_counts=True)
         for class_id, count in zip(unique, counts):
@@ -123,7 +126,7 @@ def generate_latex_table(results, output_file):
     lines = []
     lines.append(r"\begin{table*}[htbp]")
     lines.append(r"\centering")
-    lines.append(r"\caption{ZOD Dataset Statistics by Split and Weather Condition}")
+    lines.append(r"\caption{ZOD Dataset Pixel Statistics by Split and Weather Condition (384×384 Resolution)}")
     lines.append(r"\begin{tabular}{@{}l l r r r r r @{}}")
     lines.append(r"\toprule")
     lines.append(r"Split & Weather & Samples & Background & Vehicle & Vuln. Users & Sign \\")

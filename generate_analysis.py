@@ -316,6 +316,27 @@ def main():
 
     print(f"✅ Successfully analyzed {len(frame_analyses)} frames")
 
+    # Select best 2 frames per weather condition for visualization (total 10)
+    print("\n🎨 Selecting best frames for visualization (2 per weather condition)...")
+    selected_frames = []
+    for condition in CONDITIONS:
+        condition_frames = [a for a in frame_analyses if a.get('weather') == condition]
+        if condition_frames:
+            # Sort by object_pixels descending (most objects first)
+            condition_frames.sort(key=lambda x: -x['object_pixels'])
+            # Take top 2
+            selected_frames.extend(condition_frames[:2])
+            print(f"  {condition}: selected {len(condition_frames[:2])} frames")
+    
+    print(f"✅ Selected {len(selected_frames)} frames for visualization")
+
+    # Save selected frames to visualization.txt
+    with open(SPLITS_DIR / "visualization.txt", 'w') as f:
+        for analysis in sorted(selected_frames, key=lambda x: x['frame_id']):
+            f.write(f"camera/frame_{analysis['frame_id']}.png\n")
+
+    # Continue with all frames for analysis and splits
+
     # Create balanced splits
     print("\n🎯 Creating balanced train/validation splits...")
     train_analyses, val_analyses = create_balanced_splits(frame_analyses, args.train_ratio)

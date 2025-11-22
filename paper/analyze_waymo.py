@@ -90,6 +90,9 @@ def analyze_frames_pixel_distribution(frame_paths, split_name, condition):
         if mask is None:
             continue
 
+        # Resize to 384x384 to match training resolution
+        mask = cv2.resize(mask, (384, 384), interpolation=cv2.INTER_NEAREST)
+
         unique_classes, counts = np.unique(mask, return_counts=True)
         
         # Update totals
@@ -120,7 +123,7 @@ def generate_latex_table(results, output_file='waymo_table.tex'):
     lines = []
     lines.append(r"\begin{table*}[htbp]")
     lines.append(r"\centering")
-    lines.append(r"\caption{Waymo Dataset Statistics by Split and Weather Condition}")
+    lines.append(r"\caption{Waymo Dataset Pixel Statistics by Split and Weather Condition (384×384 Resolution)}")
     lines.append(r"\begin{tabular}{@{}l l r r r r r @{}}")
     lines.append(r"\toprule")
     lines.append(r"Split & Weather & Samples & Background & Vehicle & Vuln. Users & Sign \\")
