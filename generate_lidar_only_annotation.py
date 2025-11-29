@@ -409,11 +409,16 @@ class LiDARPNGAnnotationGenerator:
                                 
                                 camera_overlay = self.create_overlay_visualization(camera_img, colored_mask, "Camera + LiDAR Annotations")
                                 
+                                # Ensure consistent color space (BGR) before stacking
+                                if lidar_overlay.shape[2] == 3:
+                                    lidar_overlay = cv2.cvtColor(lidar_overlay, cv2.COLOR_RGB2BGR)
+                                # camera_overlay is already BGR from create_overlay_visualization
+                                
                                 # Stack vertically: LiDAR on top, Camera on bottom
                                 vis_data = np.vstack([lidar_overlay, camera_overlay])
                             else:
                                 # Fallback: Just LiDAR overlay if no camera available
-                                vis_data = lidar_overlay
+                                vis_data = cv2.cvtColor(lidar_overlay, cv2.COLOR_RGB2BGR) if lidar_overlay.shape[2] == 3 else lidar_overlay
                         else:
                             # Fallback to colored mask only
                             colored_annotation = np.zeros((annotation.shape[0], annotation.shape[1], 3), dtype=np.uint8)

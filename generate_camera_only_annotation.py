@@ -239,7 +239,7 @@ class CameraOnlyAnnotationGenerator:
                                 colored_mask[mask_pixels], alpha, 0
                             )
                             
-                            cv2.imwrite(str(vis_path), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+                            cv2.imwrite(str(vis_path), overlay)
                         
                         vis_count += 1
                     except Exception as e:
