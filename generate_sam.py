@@ -8,11 +8,9 @@ Production ZOD dataset processor based on WORKING visualization code
 """
 
 import numpy as np
-from PIL import Image
 import cv2
 import torch
 from pathlib import Path
-import json
 from datetime import datetime
 from tqdm import tqdm
 import argparse
@@ -50,7 +48,16 @@ signal.signal(signal.SIGINT, signal_handler)
 
 
 class ZODProcessor:
-    """Process ZOD dataset with SAM using proven working logic"""
+    """
+    Processes ZOD dataset frames using SAM (Segment Anything Model) to generate semantic segmentation masks.
+    
+    This class handles:
+    - Loading ZOD dataset and SAM model
+    - Filtering and deduplicating bounding boxes
+    - Generating segmentation masks using SAM
+    - Saving outputs in multiple formats
+    - Progress tracking and resume capability
+    """
     
     def __init__(self, 
                  dataset_root: str,
@@ -60,6 +67,18 @@ class ZODProcessor:
                  target_resolution: int = 768,
                  gpu_batch_size: int = 4,
                  preload_workers: int = 8):
+        """
+        Initialize the ZOD processor.
+        
+        Args:
+            dataset_root: Path to ZOD dataset root directory
+            output_root: Directory where processed outputs will be saved
+            sam_model_type: SAM model variant ('vit_b', 'vit_l', 'vit_h')
+            sam_resolution: Resolution for SAM processing (lower = faster)
+            target_resolution: Output resolution for saved images
+            gpu_batch_size: Batch size for GPU processing (currently unused)
+            preload_workers: Number of threads for parallel data preloading
+        """
         
         self.dataset_root = Path(dataset_root)
         self.output_root = Path(output_root)
@@ -69,50 +88,51 @@ class ZODProcessor:
         self.gpu_batch_size = gpu_batch_size
         self.preload_workers = preload_workers
         
-        # Create output directories
+        # Create output directories for different types of outputs
         self.output_dirs = {
-            'annotation': self.output_root / 'annotation_sam',
-            'camera': self.output_root / 'camera',
-            'overlay': self.output_root / 'visualizations' / 'overlay',
-            'boxes': self.output_root / 'visualizations' / 'boxes',
+            'annotation': self.output_root / 'annotation_sam',  # Semantic segmentation masks
+            'camera': self.output_root / 'camera',              # Processed camera images
+            'overlay': self.output_root / 'visualizations' / 'overlay',  # Masks overlaid on images
+            'boxes': self.output_root / 'visualizations' / 'boxes',      # Images with bounding boxes
         }
         
         for dir_path in self.output_dirs.values():
             dir_path.mkdir(parents=True, exist_ok=True)
         
-        # Progress tracking
+        # Progress tracking files for resume capability
         self.completed_file = self.output_root / 'completed_frames.txt'
         self.failed_file = self.output_root / 'failed_frames.txt'
-        self.completed_frames = self._load_completed_frames()
+        self.completed_frames = self._load_completed_frames()  # Load previously completed frames
         self.failed_frames = set()
         
-        # Statistics
+        # Statistics tracking for performance monitoring
         self.stats = {
             'successful': 0,
             'failed': 0,
             'start_time': datetime.now().isoformat(),
-            'total_filter_time': 0.0,
-            'total_dedup_time': 0.0,
-            'total_sam_time': 0.0,
-            'total_save_time': 0.0,
+            'total_filter_time': 0.0,    # Time spent filtering objects
+            'total_dedup_time': 0.0,     # Time spent deduplicating boxes
+            'total_sam_time': 0.0,       # Time spent on SAM inference
+            'total_save_time': 0.0,      # Time spent saving outputs
         }
         
-        # Class mapping (CLFT format: 2=Vehicle, 3=Sign, 4=Cyclist, 5=Pedestrian)
+        # Class mapping from ZOD classes to CLFT format IDs
+        # CLFT format: 2=Vehicle, 3=Sign, 4=Cyclist, 5=Pedestrian
         self.class_mapping = {
             'Vehicle': 2,
-            'VulnerableVehicle': 4,
+            'VulnerableVehicle': 4,  # Maps to Cyclist
             'Pedestrian': 5,
-            'PoleObject': 3,
+            'PoleObject': 3,         # Maps to Sign
             'TrafficSign': 3,
             'TrafficLight': 3,
             'TrafficSignal': 3,
             'TrafficGuide': 3,
         }
         
-        # Priority for overlap resolution
+        # Priority for overlap resolution (higher number = higher priority)
         self.priority = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5}
         
-        # Class-specific minimum size thresholds
+        # Class-specific minimum size thresholds (in pixels)
         self.min_size_by_class = {
             1: 10,  # Lane
             2: 30,  # Vehicle
@@ -121,7 +141,7 @@ class ZODProcessor:
             5: 15,  # Pedestrian
         }
         
-        # Colors for visualization (BGR format for OpenCV) - Very distinct colors
+        # Colors for visualization (BGR format for OpenCV) - Distinct colors for each class
         self.class_colors = {
             1: (128, 64, 128),   # Lane - purple
             2: (0, 0, 255),      # Vehicle - bright red
@@ -137,25 +157,26 @@ class ZODProcessor:
         print(f"⚙️  Preload workers: {self.preload_workers}")
     
     def _load_completed_frames(self):
-        """Load list of already completed frames"""
+        """Load list of already completed frames for resume capability"""
         if self.completed_file.exists():
             with open(self.completed_file, 'r') as f:
                 return set(line.strip() for line in f if line.strip())
         return set()
     
     def initialize_models(self):
-        """Initialize ZOD and SAM models"""
+        """Initialize ZOD dataset and SAM model"""
         print("\n🤖 Initializing models...")
         
-        # Load ZOD
+        # Load ZOD dataset
         from zod import ZodFrames
         print("Loading ZOD dataset...")
         self.zod = ZodFrames(dataset_root=str(self.dataset_root), version="full")
         print(f"✅ Loaded {len(self.zod)} frames")
         
-        # Load SAM
+        # Load SAM model
         from segment_anything import sam_model_registry, SamPredictor
         
+        # Map model types to checkpoint files
         model_paths = {
             'vit_b': 'models/sam_vit_b_01ec64.pth',
             'vit_l': 'models/sam_vit_l_0b3195.pth',
@@ -166,31 +187,41 @@ class ZODProcessor:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         print(f"Loading SAM model ({self.sam_model_type}) on {device}...")
         
+        # Load and configure SAM model
         sam = sam_model_registry[self.sam_model_type](checkpoint=sam_checkpoint)
         sam.to(device=device)
         sam.eval()
         
         self.sam = SamPredictor(sam)
         
-        # Enable optimizations
+        # Enable memory optimizations for CUDA
         if device == 'cuda':
             self.sam.model = self.sam.model.to(memory_format=torch.channels_last)
         
         print("✅ Models initialized")
     
     def process_frame(self, frame_id: str, preloaded_data=None):
-        """Process single frame using proven working logic"""
+        """
+        Process a single frame: filter objects, deduplicate, run SAM, save outputs.
+        
+        Args:
+            frame_id: Frame identifier (e.g., '000001')
+            preloaded_data: Optional preloaded (frame, img_rgb) tuple for performance
+            
+        Returns:
+            bool: True if processing successful, False otherwise
+        """
         try:
             from zod.constants import AnnotationProject
             
-            # Use preloaded data if available
+            # Load frame data (use preloaded if available for performance)
             if preloaded_data:
                 frame, img_rgb = preloaded_data
                 h, w = img_rgb.shape[:2]
             else:
                 frame = self.zod[frame_id]
                 
-                # Load image
+                # Load and convert image
                 camera_frame = frame.info.get_key_camera_frame()
                 img_path = Path(camera_frame.filepath)
                 img = cv2.imread(str(img_path))
@@ -200,22 +231,24 @@ class ZODProcessor:
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 h, w = img_rgb.shape[:2]
             
-            # Get annotations
+            # Get object detection annotations
             annotation = frame.get_annotation(AnnotationProject.OBJECT_DETECTION)
             if annotation is None:
                 return False
             
             # ================================================================
-            # STEP 1: Filter objects (EXACT LOGIC FROM VISUALIZATION)
+            # STEP 1: Filter objects based on class, size, and aspect ratio
             # ================================================================
             t0 = time.time()
             filtered_objects = []
             
             for obj in annotation:
+                # Skip objects without 2D bounding boxes
                 if not hasattr(obj, 'box2d') or obj.box2d is None:
                     continue
                 
                 class_name = obj.name
+                # Skip unknown classes
                 if class_name not in self.class_mapping:
                     continue
                 
@@ -223,7 +256,7 @@ class ZODProcessor:
                 x_min, y_min = int(box.xmin), int(box.ymin)
                 x_max, y_max = int(box.xmax), int(box.ymax)
                 
-                # Clip to bounds
+                # Clip coordinates to image bounds
                 x_min = max(0, x_min)
                 y_min = max(0, y_min)
                 x_max = min(w, x_max)
@@ -232,19 +265,18 @@ class ZODProcessor:
                 box_w = x_max - x_min
                 box_h = y_max - y_min
                 
-                # Class-specific minimum size
+                # Apply class-specific minimum size threshold
                 class_id = self.class_mapping[class_name]
                 min_size = self.min_size_by_class.get(class_id, 30)
                 
-                # Size filtering
                 if box_w < min_size or box_h < min_size:
                     continue
                 
-                # Allow larger objects (40% of image) to include close-up vehicles
+                # Skip very large objects (likely false positives)
                 if box_w > w * 0.4 or box_h > h * 0.4:
                     continue
                 
-                # Aspect ratio
+                # Filter by aspect ratio (avoid extremely thin/tall objects)
                 aspect = max(box_w, box_h) / min(box_w, box_h) if min(box_w, box_h) > 0 else 0
                 if aspect > 8.0:
                     continue
@@ -259,7 +291,7 @@ class ZODProcessor:
             self.stats['total_filter_time'] += (t1 - t0)
             
             # ================================================================
-            # STEP 2: Deduplicate (EXACT LOGIC FROM VISUALIZATION)
+            # STEP 2: Deduplicate overlapping bounding boxes within the same class
             # ================================================================
             by_class_filtered = defaultdict(list)
             for i, (box, class_id, area) in enumerate(filtered_objects):
@@ -267,12 +299,14 @@ class ZODProcessor:
             
             deduplicated = []
             for class_id, boxes_list in by_class_filtered.items():
+                # Sort by area (largest first) for better deduplication
                 boxes_list.sort(key=lambda x: -x[2])
                 
                 kept = []
                 for i, box, area in boxes_list:
                     merged = False
                     for idx, (kept_box, kept_area) in enumerate(kept):
+                        # Check for overlap using IoU (Intersection over Union)
                         if not (box[2] < kept_box[0] or box[0] > kept_box[2] or 
                                 box[3] < kept_box[1] or box[1] > kept_box[3]):
                             x1 = max(box[0], kept_box[0])
@@ -287,6 +321,7 @@ class ZODProcessor:
                             
                             iou = intersection / union if union > 0 else 0
                             
+                            # Merge boxes if IoU > 0.3
                             if iou > 0.3:
                                 merged_box = [
                                     min(box[0], kept_box[0]),
@@ -308,11 +343,9 @@ class ZODProcessor:
             t2 = time.time()
             self.stats['total_dedup_time'] += (t2 - t1)
             
-            # SPEED OPTIMIZATION: Limit max objects per frame (focus on largest/most important)
-            MAX_OBJECTS = 75  # Process top 75 objects (balance speed vs completeness)
+            # Limit maximum objects per frame for performance (focus on largest)
+            MAX_OBJECTS = 75  # Balance between completeness and speed
             if len(deduplicated) > MAX_OBJECTS:
-                # Sort by AREA ONLY (keep biggest objects from all classes)
-                # Don't use priority here - that's for overlap resolution, not filtering
                 deduplicated.sort(key=lambda x: -x[2])  # Sort by area descending
                 deduplicated = deduplicated[:MAX_OBJECTS]
                 print(f"    ⚠️  Limited to {MAX_OBJECTS} objects (was {len(deduplicated)})")
@@ -401,7 +434,7 @@ class ZODProcessor:
                                 continue
                                 
                     except Exception as e:
-                        # Fall back to one-by-one for this batch
+                        # Fallback to individual processing if batch fails
                         for box, class_id, area in batch:
                             try:
                                 x_min, y_min, x_max, y_max = box
@@ -447,29 +480,36 @@ class ZODProcessor:
             return False
     
     def _save_outputs(self, frame_id: str, img_rgb: np.ndarray, seg_mask: np.ndarray, boxes: list):
-        """Save all outputs: annotation, camera, overlay, boxes"""
+        """
+        Save all processing outputs: camera image, annotation mask, overlay, and boxes visualization.
+        
+        Args:
+            frame_id: Frame identifier
+            img_rgb: Original RGB image
+            seg_mask: Segmentation mask at SAM resolution
+            boxes: List of (box, class_id, area) tuples
+        """
         
         h, w = img_rgb.shape[:2]
         target = self.target_resolution
         
-        # Scale based on shorter dimension
+        # Resize to target resolution (scale based on shorter dimension)
         scale = target / min(h, w)
         new_w = int(w * scale)
         new_h = int(h * scale)
         
-        # Resize image and mask
         img_resized = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         mask_resized = cv2.resize(seg_mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
         
-        # 1. Save camera image
+        # 1. Save processed camera image
         camera_file = self.output_dirs['camera'] / f"frame_{frame_id}.png"
         cv2.imwrite(str(camera_file), cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR))
         
-        # 2. Save annotation (grayscale)
+        # 2. Save semantic segmentation annotation (grayscale mask)
         anno_file = self.output_dirs['annotation'] / f"frame_{frame_id}.png"
         cv2.imwrite(str(anno_file), mask_resized.astype(np.uint8))
         
-        # 3. Create segmentation visualization (colored masks)
+        # 3. Create colored segmentation visualization
         seg_vis = np.zeros((new_h, new_w, 3), dtype=np.uint8)
         for class_id in range(1, 6):
             mask = mask_resized == class_id
@@ -477,18 +517,18 @@ class ZODProcessor:
                 color = self.class_colors.get(class_id, (255, 255, 255))
                 seg_vis[mask] = color
         
-        # 4. Save overlay
+        # 4. Save overlay (segmentation masks overlaid on original image)
         overlay = img_resized.copy()
         alpha = 0.5
         overlay = cv2.addWeighted(overlay, 1-alpha, seg_vis, alpha, 0)
         overlay_file = self.output_dirs['overlay'] / f"frame_{frame_id}.png"
         cv2.imwrite(str(overlay_file), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
         
-        # 5. Save boxes visualization
+        # 5. Save bounding boxes visualization
         img_boxes = img_resized.copy()
         for box, class_id, area in boxes:
             x_min, y_min, x_max, y_max = box
-            # Scale box coordinates
+            # Scale box coordinates to target resolution
             x_min = int(x_min * scale)
             y_min = int(y_min * scale)
             x_max = int(x_max * scale)
@@ -501,14 +541,19 @@ class ZODProcessor:
         cv2.imwrite(str(boxes_file), cv2.cvtColor(img_boxes, cv2.COLOR_RGB2BGR))
     
     def process_dataset(self, frame_list_file: str):
-        """Process frames from list with parallel preloading"""
+        """
+        Process all frames from a list file with parallel preloading for performance.
+        
+        Args:
+            frame_list_file: Path to text file containing frame IDs (one per line)
+        """
         
         print(f"\n📋 Reading frame list from: {frame_list_file}")
         with open(frame_list_file, 'r') as f:
             all_frame_ids = [line.strip() for line in f if line.strip()]
         print(f"✓ Loaded {len(all_frame_ids)} frames")
         
-        # Remove already processed
+        # Filter out already completed frames for resume capability
         remaining_frames = [fid for fid in all_frame_ids if fid not in self.completed_frames]
         
         if len(self.completed_frames) > 0:
@@ -520,11 +565,10 @@ class ZODProcessor:
             print("✅ All frames already processed!")
             return
         
-        # Preloading function
+        # Preloading function for parallel I/O
         def preload_frame_data(frame_id):
-            """Preload frame data on CPU while GPU is busy"""
+            """Preload frame data on CPU while GPU is busy for better performance"""
             try:
-                from zod.constants import Anonymization
                 frame = self.zod[frame_id]
                 camera_frame = frame.info.get_key_camera_frame()
                 img_path = Path(camera_frame.filepath)
@@ -538,16 +582,17 @@ class ZODProcessor:
         
         pbar = tqdm(remaining_frames, desc="Processing", unit="frame")
         
-        # Use thread pool for parallel I/O preloading
+        # Use thread pool for parallel I/O preloading to overlap CPU and GPU work
         with ThreadPoolExecutor(max_workers=self.preload_workers) as executor:
-            # Submit first batch of frames for preloading
+            # Submit initial batch of frames for preloading
             future_to_frame = {}
             for i in range(min(self.preload_workers, len(remaining_frames))):
                 future = executor.submit(preload_frame_data, remaining_frames[i])
                 future_to_frame[future] = remaining_frames[i]
             
+            # Process frames in order, using preloaded data when available
             for idx, frame_id in enumerate(pbar):
-                # Get preloaded data
+                # Retrieve preloaded data for current frame
                 preloaded_data = None
                 for future in list(future_to_frame.keys()):
                     if future_to_frame[future] == frame_id:
@@ -555,15 +600,16 @@ class ZODProcessor:
                         del future_to_frame[future]
                         break
                 
-                # Submit next frame for preloading
+                # Submit next frame for preloading to maintain pipeline
                 next_idx = idx + self.preload_workers
                 if next_idx < len(remaining_frames):
                     future = executor.submit(preload_frame_data, remaining_frames[next_idx])
                     future_to_frame[future] = remaining_frames[next_idx]
                 
-                # Process frame with preloaded data
+                # Process the frame
                 success = self.process_frame(frame_id, preloaded_data)
                 
+                # Update progress tracking and save completion status
                 if success:
                     self.stats['successful'] += 1
                     self.completed_frames.add(frame_id)
@@ -574,7 +620,7 @@ class ZODProcessor:
                     with open(self.failed_file, 'a') as f:
                         f.write(f"{frame_id}\n")
                 
-                # Update progress
+                # Update progress bar with statistics
                 total_processed = self.stats['successful'] + self.stats['failed']
                 if total_processed > 0:
                     avg_filter = self.stats['total_filter_time'] / total_processed
@@ -593,7 +639,7 @@ class ZODProcessor:
                         'failed': self.stats['failed'],
                     })
                 
-                # Memory cleanup every 50 frames
+                # Periodic memory cleanup to prevent memory leaks
                 if (self.stats['successful'] + self.stats['failed']) % 50 == 0:
                     gc.collect()
                     if torch.cuda.is_available():
@@ -617,35 +663,36 @@ class ZODProcessor:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Process ZOD dataset with working SAM code")
+    """Main entry point for the ZOD SAM processing script"""
+    parser = argparse.ArgumentParser(description="Process ZOD dataset with SAM to generate semantic segmentation masks")
     
     parser.add_argument('--dataset-root', type=str, default='/media/tom/ml/zod-data',
-                       help='Path to ZOD dataset root')
+                       help='Path to ZOD dataset root directory')
     parser.add_argument('--output-root', type=str, default='/media/tom/ml/zod_temp',
-                       help='Output directory')
+                       help='Output directory for processed results')
     parser.add_argument('--frame-list', type=str, default='frames_to_process.txt',
-                       help='Path to frames_to_process.txt')
+                       help='Path to text file containing frame IDs to process')
     parser.add_argument('--sam-model', type=str, choices=['vit_b', 'vit_l', 'vit_h'],
-                       default='vit_h', help='SAM model type')
+                       default='vit_h', help='SAM model variant (vit_h is most accurate but slowest)')
     parser.add_argument('--sam-resolution', type=int, default=1024,
-                       help='SAM processing resolution (lower = faster)')
+                       help='Resolution for SAM processing (lower values are faster)')
     parser.add_argument('--target-resolution', type=int, default=768,
-                       help='Target output resolution')
+                       help='Resolution for output images and masks')
     parser.add_argument('--gpu-batch-size', type=int, default=4,
-                       help='GPU batch size (unused for now)')
+                       help='GPU batch size (currently not used in batching)')
     parser.add_argument('--preload-workers', type=int, default=8,
-                       help='Preload workers (unused for now)')
+                       help='Number of threads for parallel data preloading')
     
     args = parser.parse_args()
     
-    # Check if frame list exists
+    # Validate input file exists
     if not Path(args.frame_list).exists():
         print(f"❌ Error: Frame list file not found: {args.frame_list}")
         return
     
     processor = None
     try:
-        # Create processor
+        # Initialize the processor with configuration
         processor = ZODProcessor(
             dataset_root=args.dataset_root,
             output_root=args.output_root,
@@ -656,10 +703,10 @@ def main():
             preload_workers=args.preload_workers,
         )
         
-        # Initialize models
+        # Load ZOD dataset and SAM model
         processor.initialize_models()
         
-        # Process dataset
+        # Process all frames in the list
         processor.process_dataset(frame_list_file=args.frame_list)
         
     except KeyboardInterrupt:
@@ -668,7 +715,7 @@ def main():
         print(f"\n❌ Error: {e}")
         traceback.print_exc()
     finally:
-        # Always cleanup
+        # Ensure GPU memory is cleaned up
         print("\n🧹 Final cleanup...")
         cleanup_gpu()
 
