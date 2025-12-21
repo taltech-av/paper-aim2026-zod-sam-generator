@@ -8,39 +8,6 @@ The Zenseact Open Dataset (ZOD) provides valuable multi-modal data for autonomou
 
 This codebase accompanies the paper "SAM-Enhanced Semantic Segmentation on ZOD: Specialized Models for Vulnerable Road Users".
 
-## Prerequisites
-
-- Docker
-- ZOD dataset files (mini or full version)
-
-## Setup and Installation
-### Start the Application
-CPU-only (lightweight):
-```
-docker compose run --rm --service-ports python-lite bash
-```
-
-GPU-enabled (CUDA):
-```  
-docker compose run --rm --service-ports python-cuda bash
-```
-
-### Data Preparation
-Copy the unpacked ZOD data files to the `/data` folder:
-- `drives_mini.tar.gz`
-- `frames_mini.tar.gz`
-- `sequences_mini.tar.gz`
-
-Run command to extract data:
-```
-sh scripts/extract_zod_data.sh
-```
-
-### Start jupyter
-```
-scripts/jupyter_startup.sh
-```
-
 ## Setup Virtual Environment
 
 1. Create a virtual environment:
@@ -58,7 +25,7 @@ scripts/jupyter_startup.sh
    pip install -r requirements.txt
    ```
 
-# Full download
+# ZOD Data full download
 ```bash
 zod download \
   --url="https://www.dropbox.com/scl/fo/q81qqpiqygaeys7mppgoe/AFuqa-QrSkGzHmnkhhpvbBE?dl=0&e=3&rlkey=ocr9n0gq3u083zj8sn1yo1ak6" \
@@ -93,16 +60,9 @@ This project includes a complete pipeline for processing ZOD data into CLFT (Cam
 ### 3. Annotation Generation
 - **`generate_camera_only_annotation.py`**: Produces camera-only segmentation annotations with minimal ignore regions, optimized for camera-based training.
 - **`generate_lidar_only_annotation.py`**: Creates LiDAR-native segmentation annotations using SAM guidance, designed for LiDAR-focused model training.
-- **`generate_fusion_annotation.py`**: Generates fusion annotations combining camera and LiDAR data for multi-modal training scenarios.
 
 ### 4. Dataset Analysis and Splitting
 - **`generate_balanced_splits.py`**: Analyzes processed frames and creates balanced train/validation splits ensuring class representation and pixel count equilibrium across weather conditions (day_fair, day_rain, night_fair, night_rain, snow).
-
-## Additional Resources
-
-- **`notebooks/`**: Jupyter notebooks for data exploration, visualization, and analysis including weather/time analysis and class distribution studies.
-- **`paper/`**: Research paper materials including performance comparisons (CLFT vs DeepLab), analysis scripts, and visualization diagrams.
-- **`scripts/`**: Utility scripts for data extraction (`extract_zod_data.sh`) and Jupyter environment setup (`jupyter_startup.sh`).
 
 ## Usage Example
 
@@ -119,17 +79,7 @@ python generate_lidar_png.py
 # Create annotations for different modalities
 python generate_camera_only_annotation.py
 python generate_lidar_only_annotation.py
-python generate_fusion_annotation.py
 
 # Analyze and create balanced splits
 python generate_balanced_splits.py
 ```
-
-## Key Files and Models
-
-- **`good_framest.txt`**: Pre-filtered list of high-quality frames for processing (2300+ frames)
-- **`models/`**: Pre-trained models including:
-  - SAM models (ViT-B, ViT-L, ViT-H) for semantic segmentation
-  - YOLO models (YOLOv8, YOLO11) for object detection
-- **`requirements.txt`**: Python dependencies for the processing pipeline
-- **`compose.yml`**: Docker Compose configuration for CPU/GPU environments
