@@ -208,77 +208,60 @@ def analyze_frame_pixels(frame_id):
         return None
 
 
-def create_balanced_splits(frame_analyses, train_ratio=0.8):
+def create_balanced_splits_per_weather(frame_analyses):
     """
-    Create balanced train/validation splits ensuring class representation and pixel balance.
+    Create balanced train/validation/test splits per weather condition ensuring class representation and pixel balance.
 
-    Implements a sophisticated splitting strategy:
-    1. Sort frames by total pixels (largest first)
-    2. Alternate assignment to balance pixel counts between splits
-    3. Verify all classes are represented in both splits
-    4. Correct any missing classes by moving frames between splits
+    For each weather condition, splits frames into:
+    - Train: 50%
+    - Validation: 25%
+    - Test: 25%
+
+    Uses stratified splitting based on the dominant class (class with most pixels) to balance class frequencies.
 
     Args:
         frame_analyses: List of frame analysis dictionaries
-        train_ratio: Desired training ratio (default: 0.8)
 
     Returns:
-        tuple: (train_analyses, val_analyses) - Lists of analysis dicts for each split
+        tuple: (train_analyses, val_analyses, test_analyses) - Lists of analysis dicts for each split
     """
-    # ===== INITIAL SORTING =====
-    # Sort frames by total pixels descending to prioritize larger frames
-    frame_analyses.sort(key=lambda x: -x['total_pixels'])
-
     train_analyses = []
     val_analyses = []
+    test_analyses = []
 
-    # ===== ALTERNATING ASSIGNMENT =====
-    # Assign frames alternately to balance total pixel counts between splits
-    for i, analysis in enumerate(frame_analyses):
-        if i % 2 == 0:
-            train_analyses.append(analysis)
-        else:
-            val_analyses.append(analysis)
+    # Group frames by weather condition
+    weather_groups = defaultdict(list)
+    for analysis in frame_analyses:
+        weather = analysis.get('weather')
+        if weather:
+            weather_groups[weather].append(analysis)
 
-    # ===== CLASS REPRESENTATION VERIFICATION =====
-    # Ensure all classes are represented in both training and validation splits
+    for condition, frames in weather_groups.items():
+        if not frames:
+            continue
 
-    # Get classes present in each split
-    train_classes = set()
-    for a in train_analyses:
-        train_classes.update(a['classes_present'])
+        # Group frames by dominant class
+        class_groups = defaultdict(list)
+        for frame in frames:
+            if frame['pixel_counts']:
+                dominant_class = max(frame['pixel_counts'], key=frame['pixel_counts'].get)
+                class_groups[dominant_class].append(frame)
+            else:
+                class_groups[0].append(frame)  # Default to background
 
-    val_classes = set()
-    for a in val_analyses:
-        val_classes.update(a['classes_present'])
+        # For each class group, split proportionally
+        for cls, group_frames in class_groups.items():
+            random.shuffle(group_frames)  # Shuffle for randomness
+            n_frames = len(group_frames)
+            n_train = int(n_frames * 0.5)
+            n_val = int(n_frames * 0.25)
+            n_test = n_frames - n_train - n_val
 
-    # Identify missing classes
-    all_classes = set(CLASS_NAMES.keys())
-    missing_in_train = all_classes - train_classes
-    missing_in_val = all_classes - val_classes
+            train_analyses.extend(group_frames[:n_train])
+            val_analyses.extend(group_frames[n_train:n_train + n_val])
+            test_analyses.extend(group_frames[n_train + n_val:])
 
-    # ===== CLASS BALANCE CORRECTION =====
-    # Move frames between splits to ensure all classes are represented
-
-    # Fix missing classes in training set
-    for class_id in missing_in_train:
-        # Find a frame with this class in validation and move to training
-        for a in val_analyses[:]:  # Copy list to avoid modification during iteration
-            if class_id in a['classes_present']:
-                val_analyses.remove(a)
-                train_analyses.append(a)
-                break
-
-    # Fix missing classes in validation set
-    for class_id in missing_in_val:
-        # Find a frame with this class in training and move to validation
-        for a in train_analyses[:]:  # Copy list to avoid modification during iteration
-            if class_id in a['classes_present']:
-                train_analyses.remove(a)
-                val_analyses.append(a)
-                break
-
-    return train_analyses, val_analyses
+    return train_analyses, val_analyses, test_analyses
 
 
 def save_frame_analysis(analyses, output_path):
@@ -308,18 +291,20 @@ def save_frame_analysis(analyses, output_path):
         }, f, indent=2)
 
 
-def save_split_files(train_analyses, val_analyses, frame_analyses, splits_dir):
+def save_split_files(train_analyses, val_analyses, test_analyses, frame_analyses, splits_dir):
     """
-    Save train/validation split files and weather-based test splits.
+    Save train/validation/test split files.
 
-    Creates multiple split files:
+    Creates split files:
     - train.txt: Training frame paths
     - validation.txt: Validation frame paths
+    - test.txt: Test frame paths
     - test_{condition}.txt: Test frames for each weather condition
 
     Args:
         train_analyses: List of training frame analyses
         val_analyses: List of validation frame analyses
+        test_analyses: List of test frame analyses
         frame_analyses: Complete list of all frame analyses
         splits_dir: Directory where split files should be saved
     """
@@ -339,38 +324,45 @@ def save_split_files(train_analyses, val_analyses, frame_analyses, splits_dir):
         for analysis in sorted(val_analyses, key=lambda x: x['frame_id']):
             f.write(f"{format_path(analysis['frame_id'])}\n")
 
+    # ===== SAVE TEST SPLIT =====
+    with open(splits_dir / "test.txt", 'w') as f:
+        for analysis in sorted(test_analyses, key=lambda x: x['frame_id']):
+            f.write(f"{format_path(analysis['frame_id'])}\n")
+
     # ===== SAVE WEATHER-BASED TEST SPLITS =====
     # Create separate test files for each weather condition
     for condition in CONDITIONS:
-        condition_frames = [a for a in frame_analyses if a.get('weather') == condition]
+        condition_frames = [a for a in test_analyses if a.get('weather') == condition]
         if condition_frames:
             with open(splits_dir / f"test_{condition}.txt", 'w') as f:
                 for analysis in sorted(condition_frames, key=lambda x: x['frame_id']):
                     f.write(f"{format_path(analysis['frame_id'])}\n")
 
 
-def print_summary(train_analyses, val_analyses, frame_analyses):
+def print_summary(train_analyses, val_analyses, test_analyses, frame_analyses):
     """
     Print comprehensive summary of dataset analysis and splits.
 
     Displays detailed statistics including:
     - Frame counts and weather distribution
     - Pixel statistics per weather condition
-    - Class representation in train/validation splits
+    - Class representation in train/validation/test splits
     - Balance verification
 
     Args:
         train_analyses: List of training frame analyses
         val_analyses: List of validation frame analyses
+        test_analyses: List of test frame analyses
         frame_analyses: Complete list of all frame analyses
     """
     print("\n" + "="*60)
     print("🎯 Dataset Analysis Summary")
     print("="*60)
 
-    print(f"📊 Total frames analyzed: {len(train_analyses) + len(val_analyses)}")
-    print(f"🎯 Training frames: {len(train_analyses)}")
-    print(f"✅ Validation frames: {len(val_analyses)}")
+    print(f"📊 Total frames analyzed: {len(frame_analyses)}")
+    print(f"🎯 Training frames: {len(train_analyses)} ({len(train_analyses)/len(frame_analyses)*100:.1f}%)")
+    print(f"✅ Validation frames: {len(val_analyses)} ({len(val_analyses)/len(frame_analyses)*100:.1f}%)")
+    print(f"🧪 Test frames: {len(test_analyses)} ({len(test_analyses)/len(frame_analyses)*100:.1f}%)")
 
     # ===== WEATHER DISTRIBUTION ANALYSIS =====
     weather_counts = defaultdict(int)
@@ -383,6 +375,17 @@ def print_summary(train_analyses, val_analyses, frame_analyses):
         count = weather_counts[condition]
         pct = (count / len(frame_analyses) * 100) if frame_analyses else 0
         print(f"  {condition}: {count} frames ({pct:.1f}%)")
+
+    # ===== SPLIT DISTRIBUTION PER WEATHER =====
+    print("\n📊 Split Distribution per Weather Condition:")
+    for condition in CONDITIONS:
+        condition_frames = [a for a in frame_analyses if a.get('weather') == condition]
+        train_cond = [a for a in train_analyses if a.get('weather') == condition]
+        val_cond = [a for a in val_analyses if a.get('weather') == condition]
+        test_cond = [a for a in test_analyses if a.get('weather') == condition]
+        if condition_frames:
+            total = len(condition_frames)
+            print(f"  {condition}: Train {len(train_cond)} ({len(train_cond)/total*100:.1f}%), Val {len(val_cond)} ({len(val_cond)/total*100:.1f}%), Test {len(test_cond)} ({len(test_cond)/total*100:.1f}%)")
 
     # ===== PIXEL STATISTICS PER WEATHER CONDITION =====
     print("\n📊 Pixel Statistics per Weather Condition:")
@@ -422,30 +425,121 @@ def print_summary(train_analyses, val_analyses, frame_analyses):
 
     train_counts, train_pixels = get_class_counts(train_analyses)
     val_counts, val_pixels = get_class_counts(val_analyses)
+    test_counts, test_pixels = get_class_counts(test_analyses)
 
     # Calculate total pixels for percentage calculations
     total_train_pixels = sum(train_pixels.values())
     total_val_pixels = sum(val_pixels.values())
+    total_test_pixels = sum(test_pixels.values())
 
     # ===== CLASS REPRESENTATION TABLE =====
-    print("\n📋 Class Representation in Train/Validation Splits:")
-    header = f"{'Class':<12} {'Train':>8} {'Train%':>8} {'TrainPx':>10} {'TrainPx%':>10} {'Val':>8} {'Val%':>8} {'ValPx':>10} {'ValPx%':>10}"
+    print("\n📋 Class Representation in Train/Validation/Test Splits:")
+    header = f"{'Class':<12} {'Train':>8} {'Train%':>8} {'TrainPx':>10} {'TrainPx%':>10} {'Val':>8} {'Val%':>8} {'ValPx':>10} {'ValPx%':>10} {'Test':>8} {'Test%':>8} {'TestPx':>10} {'TestPx%':>10}"
     print(header)
     print("-" * len(header))
 
     for class_id, name in CLASS_NAMES.items():
         train_count = train_counts[class_id]
         val_count = val_counts[class_id]
+        test_count = test_counts[class_id]
         train_pct = (train_count / len(train_analyses) * 100) if train_analyses else 0
         val_pct = (val_count / len(val_analyses) * 100) if val_analyses else 0
+        test_pct = (test_count / len(test_analyses) * 100) if test_analyses else 0
         train_px = train_pixels[class_id]
         val_px = val_pixels[class_id]
+        test_px = test_pixels[class_id]
         train_px_pct = (train_px / total_train_pixels * 100) if total_train_pixels > 0 else 0
         val_px_pct = (val_px / total_val_pixels * 100) if total_val_pixels > 0 else 0
+        test_px_pct = (test_px / total_test_pixels * 100) if total_test_pixels > 0 else 0
 
-        print(f"{name:<12} {train_count:>8} {train_pct:>7.1f}% {train_px:>10,} {train_px_pct:>9.1f}% {val_count:>8} {val_pct:>7.1f}% {val_px:>10,} {val_px_pct:>9.1f}%")
+        print(f"{name:<12} {train_count:>8} {train_pct:>7.1f}% {train_px:>10,} {train_px_pct:>9.1f}% {val_count:>8} {val_pct:>7.1f}% {val_px:>10,} {val_px_pct:>9.1f}% {test_count:>8} {test_pct:>7.1f}% {test_px:>10,} {test_px_pct:>9.1f}%")
 
-    print("\n✅ All classes are represented in both train and validation splits!")
+    print("\n✅ Splits created with balanced class frequencies per weather condition!")
+
+
+def print_detailed_class_analysis(train_analyses, val_analyses, test_analyses, frame_analyses, output_file):
+    """
+    Print detailed class distribution analysis for each split to a file.
+
+    Shows frame counts and pixel distributions for train, validation, and test splits,
+    plus weather-specific test splits.
+
+    Args:
+        train_analyses: List of training frame analyses
+        val_analyses: List of validation frame analyses
+        test_analyses: List of test frame analyses
+        frame_analyses: Complete list of all frame analyses
+        output_file: Path to output file for the analysis
+    """
+    with open(output_file, 'w') as f:
+        f.write("="*80 + "\n")
+        f.write("📊 DETAILED CLASS DISTRIBUTION ANALYSIS\n")
+        f.write("="*80 + "\n")
+
+        def analyze_split_class_distribution(frames, split_name):
+            f.write(f"\n📊 {split_name.upper()} CLASS DISTRIBUTION:\n")
+            f.write("=" * 60 + "\n")
+
+            total_frames = len(frames)
+            f.write(f"Total frames: {total_frames}\n")
+
+            # Class counts (frames containing each class)
+            class_frame_counts = defaultdict(int)
+            # Pixel totals per class
+            class_pixel_totals = defaultdict(int)
+            # Total pixels across all frames
+            total_pixels = 0
+
+            for analysis in frames:
+                frame_id = analysis['frame_id']
+                for cls in analysis['classes_present']:
+                    class_frame_counts[cls] += 1
+                for cls_str, pixels in analysis['pixel_counts'].items():
+                    cls = int(cls_str)
+                    class_pixel_totals[cls] += pixels
+                total_pixels += analysis['total_pixels']
+
+            # Sort classes by frame count
+            sorted_classes = sorted(class_frame_counts.keys())
+
+            f.write("\nFrame counts (frames containing each class):\n")
+            f.write("Class | Frames | Percentage\n")
+            f.write("-" * 30 + "\n")
+            for cls in sorted_classes:
+                count = class_frame_counts[cls]
+                pct = (count / total_frames) * 100
+                f.write(f"{cls:>5} | {count:>6} | {pct:>9.1f}%\n")
+
+            f.write(f"\nPixel distribution (total pixels: {total_pixels:,}):\n")
+            f.write("Class | Pixels | Percentage\n")
+            f.write("-" * 30 + "\n")
+            for cls in sorted_classes:
+                pixels = class_pixel_totals[cls]
+                pct = (pixels / total_pixels) * 100 if total_pixels > 0 else 0
+                f.write(f"{cls:>5} | {pixels:>10,} | {pct:>9.1f}%\n")
+
+        # Analyze main splits
+        analyze_split_class_distribution(train_analyses, "train")
+        analyze_split_class_distribution(val_analyses, "validation")
+        analyze_split_class_distribution(test_analyses, "test")
+
+        # Analyze weather-specific test splits
+        f.write("\n" + "="*80 + "\n")
+        f.write("🌤️ WEATHER-SPECIFIC TEST SPLIT DISTRIBUTIONS\n")
+        f.write("="*80 + "\n")
+
+        weather_groups = defaultdict(list)
+        for analysis in test_analyses:
+            weather = analysis.get('weather')
+            if weather:
+                weather_groups[weather].append(analysis)
+
+        for condition in CONDITIONS:
+            if condition in weather_groups:
+                condition_name = condition.replace('_', ' ').title()
+                analyze_split_class_distribution(weather_groups[condition], f"Test {condition_name}")
+
+    print(f"📊 Detailed class analysis saved to: {output_file}")
 
 
 def main():
@@ -455,10 +549,8 @@ def main():
     Command-line interface for running the analysis with configurable parameters.
     """
     parser = argparse.ArgumentParser(description="Generate analysis for good frames with balanced splits")
-    parser.add_argument('--good-frames', type=str, default='good_framest.txt',
+    parser.add_argument('--good-frames', type=str, default='data/all.txt',
                        help='Path to good frames file')
-    parser.add_argument('--train-ratio', type=float, default=0.8,
-                       help='Ratio of frames for training (default: 0.8)')
     args = parser.parse_args()
 
     print("🚀 CLFT-ZOD Dataset Analysis and Balanced Split Generation")
@@ -500,16 +592,19 @@ def main():
             f.write(f"camera/frame_{analysis['frame_id']}.png\n")
 
     # ===== CREATE BALANCED SPLITS =====
-    print("\n🎯 Creating balanced train/validation splits...")
-    train_analyses, val_analyses = create_balanced_splits(frame_analyses, args.train_ratio)
+    print("\n🎯 Creating balanced train/validation/test splits per weather condition...")
+    train_analyses, val_analyses, test_analyses = create_balanced_splits_per_weather(frame_analyses)
 
     # ===== SAVE ALL RESULTS =====
     print("\n💾 Saving results...")
     save_frame_analysis(frame_analyses, SPLITS_DIR / "frame_analysis.json")
-    save_split_files(train_analyses, val_analyses, frame_analyses, SPLITS_DIR)
+    save_split_files(train_analyses, val_analyses, test_analyses, frame_analyses, SPLITS_DIR)
 
     # ===== PRINT COMPREHENSIVE SUMMARY =====
-    print_summary(train_analyses, val_analyses, frame_analyses)
+    print_summary(train_analyses, val_analyses, test_analyses, frame_analyses)
+
+    # ===== PRINT DETAILED CLASS ANALYSIS =====
+    print_detailed_class_analysis(train_analyses, val_analyses, test_analyses, frame_analyses, SPLITS_DIR / "detailed_class_analysis.txt")
 
     print(f"\n📁 Files saved to: {SPLITS_DIR}")
     print("✅ Dataset analysis and split generation complete!")
