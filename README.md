@@ -1,12 +1,24 @@
-# ZOD-SAM
+# ZOD-SAM Generator
 
-This project provides tools for processing and visualizing the Zenseact Open Dataset (ZOD) using camera and LiDAR data. It includes functionality to convert ZOD bounding box annotations into semantic segmentation masks using Meta's Segment Anything Model (SAM).
+This repository is the SAM-based annotation generation codebase accompanying the paper:
+
+> SAM-Enhanced Segmentation on Road Datasets: Balancing Critical Classes in Autonomous Driving
+> Toomas Tahves, Mauro Bellone, Junyi Gu, Raivo Sell
+> AIM 2026
 
 ## Overview
 
-The Zenseact Open Dataset (ZOD) provides valuable multi-modal data for autonomous driving but lacks dense semantic segmentation annotations, limiting its use for pixel-level perception tasks. We introduce a preprocessing pipeline using the Segment Anything Model (SAM) to convert ZOD's 2D bounding box annotations into dense pixel-level segmentation masks, enabling semantic segmentation training on this dataset for the first time. Due to the imperfect nature of automated mask generation, only 36% of frames passed manual quality control and were included in the final dataset. We present a comprehensive comparison between transformer-based Camera-LiDAR Fusion Transformers (CLFT) and CNN-based DeepLabV3+ architectures for multi-modal semantic segmentation on ZOD across RGB, LiDAR, and fusion modalities under diverse weather conditions. Furthermore, we investigate model specialization techniques to address class imbalance, developing separate modules optimized for large-scale objects (vehicles) and small-scale vulnerable road users (pedestrians, cyclists, traffic signs). The specialized models significantly improve detection of underrepresented safety-critical classes while maintaining overall segmentation accuracy, providing practical insights for deploying multi-modal perception systems in autonomous vehicles. To enable reproducible research, we release the complete open-source implementation of our processing pipeline.
+The Zenseact Open Dataset (ZOD) provides rich multi-sensor data from Northern European environments — including challenging rain, snow, and low-light conditions — but includes only 2D bounding-box annotations for traffic participants, lacking the dense pixel-level labels required for semantic segmentation research.
 
-This codebase accompanies the paper "SAM-Enhanced Semantic Segmentation on ZOD: Specialized Models for Vulnerable Road Users".
+This pipeline converts ZOD bounding boxes into dense segmentation masks using Meta's Segment Anything Model (SAM). Over 100,000 frames were processed; 6,400 were manually inspected and 2,300 high-quality frames (36% acceptance rate) were selected to form the curated pilot dataset. This enables the first dense multi-modal object segmentation benchmark on ZOD, focusing on dynamic traffic participants (vehicles, pedestrians, cyclists) and critical infrastructure (traffic signs).
+
+## Related Repositories
+
+| Resource | Link |
+|---|---|
+| Multi-modal fusion training framework | https://github.com/taltech-av/paper-aim2026-fusion-trainer |
+| Processed datasets (ZOD subset + Iseauto) | https://app.visin.eu/datasets |
+| Training logs and visualization dashboards | https://app.visin.eu/projects/sam-zod |
 
 ## Setup Virtual Environment
 
@@ -25,7 +37,7 @@ This codebase accompanies the paper "SAM-Enhanced Semantic Segmentation on ZOD: 
    pip install -r requirements.txt
    ```
 
-# ZOD Data full download
+## ZOD Data Download
 ```bash
 zod download \
   --url="https://www.dropbox.com/scl/fo/q81qqpiqygaeys7mppgoe/AFuqa-QrSkGzHmnkhhpvbBE?dl=0&e=3&rlkey=ocr9n0gq3u083zj8sn1yo1ak6" \
@@ -50,36 +62,36 @@ zod download \
 
 This project includes a complete pipeline for processing ZOD data into CLFT (Camera-LiDAR Fusion Transformer) format. Run the scripts in the following order:
 
-### 1. Semantic Segmentation Generation
-- **`generate_sam.py`**: Converts ZOD bounding box annotations into semantic segmentation masks using Meta's Segment Anything Model (SAM). Processes camera images to create detailed object masks for vehicles, pedestrians, signs, and cyclists.
+### 1. SAM Mask Generation
+- **`generate_sam.py`**: Converts ZOD bounding box annotations into dense pixel-level segmentation masks using SAM ViT-H. The pipeline applies class-specific size thresholds (vehicles >30 px, signs/pedestrians/cyclists >15 px), aspect-ratio constraints (<8:1), and IoU-based deduplication (IoU >0.3) before running SAM inference in batches of 16 on 1024 px images. Conflicts between overlapping masks are resolved with a class-priority scheme: pedestrians and cyclists > signs > vehicles. Outputs 768 px dense masks for vehicles, pedestrians, cyclists, and traffic signs.
 
 ### 2. LiDAR Data Processing
 - **`generate_lidar_pickle.py`**: Creates CLFT-format LiDAR pickle files containing 3D point clouds with camera projection information for camera-LiDAR fusion training.
 - **`generate_lidar_png.py`**: Generates 3D geometric LiDAR projections as 3-channel PNG images, creating visual representations of LiDAR point distributions.
 
 ### 3. Annotation Generation
-- **`generate_camera_only_annotation.py`**: Produces camera-only segmentation annotations with minimal ignore regions, optimized for camera-based training.
-- **`generate_lidar_only_annotation.py`**: Creates LiDAR-native segmentation annotations using SAM guidance, designed for LiDAR-focused model training.
+- **`generate_camera_only_annotation.py`**: Produces camera-only segmentation annotations from SAM-derived dense masks. Applies minimal ignore regions (narrow ~1% image-height border strip) and removes very small components (<25 px) to improve label reliability while preserving the full camera field of view for supervision.
+- **`generate_lidar_only_annotation.py`**: Creates LiDAR-native segmentation annotations by projecting SAM masks onto actual LiDAR returns. Applies distance filtering (up to 90 m) and strict geometric alignment without dilation, preserving the true sensor sampling pattern for LiDAR-only model training.
 
-### 4. Dataset Analysis and Splitting
-- **`generate_balanced_splits.py`**: Analyzes processed frames and creates balanced train/validation splits ensuring class representation and pixel count equilibrium across weather conditions (day_fair, day_rain, night_fair, night_rain, snow).
+### 4. Dataset Splitting
+- **`generate_splits.py`**: Analyzes processed frames and creates balanced train/validation/test splits (50%/25%/25%) ensuring class representation and pixel count equilibrium across weather conditions (day_fair, day_rain, night_fair, night_rain, snow).
 
 ## Usage Example
 
 After setting up the environment and extracting ZOD data:
 
 ```bash
-# Generate semantic segmentation masks
+# Generate SAM segmentation masks from ZOD bounding boxes
 python generate_sam.py
 
-# Process LiDAR data
+# Process LiDAR data into CLFT-compatible formats
 python generate_lidar_pickle.py
 python generate_lidar_png.py
 
-# Create annotations for different modalities
+# Create modality-specific annotations
 python generate_camera_only_annotation.py
 python generate_lidar_only_annotation.py
 
-# Analyze and create balanced splits
-python generate_balanced_splits.py
+# Generate balanced train/val/test splits
+python generate_splits.py
 ```
