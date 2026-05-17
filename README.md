@@ -12,13 +12,7 @@ The Zenseact Open Dataset (ZOD) provides rich multi-sensor data from Northern Eu
 
 This pipeline converts ZOD bounding boxes into dense segmentation masks using Meta's Segment Anything Model (SAM). Over 100,000 frames were processed; 6,400 were manually inspected and 2,300 high-quality frames (36% acceptance rate) were selected to form the curated pilot dataset. This enables the first dense multi-modal object segmentation benchmark on ZOD, focusing on dynamic traffic participants (vehicles, pedestrians, cyclists) and critical infrastructure (traffic signs).
 
-## Datasets
-Processed datasets used in this work, including the curated SAM‑generated ZOD segmentation subset and the SAM‑enhanced Iseauto annotations, can be downloaded from
-https://app.visin.eu/datasets.
-Training logs, model outputs, and visualization dashboards are accessible at
-https://app.visin.eu/projects/sam-zod.
-
-## Related Repositories
+## Related Resources
 
 | Resource | Link |
 |---|---|
