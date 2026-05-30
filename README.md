@@ -95,3 +95,16 @@ python generate_lidar_only_annotation.py
 # Generate balanced train/val/test splits
 python generate_splits.py
 ```
+
+## Bibtex
+```
+@misc{tahves2026samenhancedsegmentationroaddatasets,
+      title={SAM-Enhanced Segmentation on Road Datasets: Balancing Critical Classes in Autonomous Driving}, 
+      author={Toomas Tahves and Mauro Bellone and Junyi Gu and Raivo Sell},
+      year={2026},
+      eprint={2605.28136},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2605.28136}, 
+}
+```
